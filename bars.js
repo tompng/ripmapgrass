@@ -8,6 +8,9 @@
 const NDIR = 16;              // 180° を等分。ぼかしは対称なので逆向きの区別は不要
 const TEX = 2048;
 const REG_MIN = -512, REG_SPAN = 1024;
+// マクロ密度は texel 0.5m で、葉幅スケール (cm) の筋は原理的に出せない。
+// 筋はタイル反復する詳細密度 (2cm/texel) が担う
+const DETAIL_TEX = 1024, DETAIL_SPAN = 20.48;
 const SLAB_H = 0.35;
 const TER_EXTENT = 2400, TER_GRID = 512;
 const GRID_N = 100, CELL = 0.5;
@@ -71,6 +74,38 @@ function genDensity() {
     }
   }
   return { rho: a, mean: sum / (TEX * TEX) };
+}
+
+function vnT(x, z, period, seed) {
+  const xi = Math.floor(x), zi = Math.floor(z);
+  const xf = x - xi, zf = z - zi;
+  const u = xf * xf * (3 - 2 * xf), v = zf * zf * (3 - 2 * zf);
+  const wrap = t => ((t % period) + period) % period;
+  const a = hashi(wrap(xi) + seed, wrap(zi) + seed * 3);
+  const b = hashi(wrap(xi + 1) + seed, wrap(zi) + seed * 3);
+  const c = hashi(wrap(xi) + seed, wrap(zi + 1) + seed * 3);
+  const d = hashi(wrap(xi + 1) + seed, wrap(zi + 1) + seed * 3);
+  return (a * (1 - u) + b * u) * (1 - v) + (c * (1 - u) + d * u) * v;
+}
+
+// 葉幅〜株幅 (8cm/32cm) スケールのタイル詳細密度。ノイズ格子をタイル周期で
+// ラップさせてシームレスにする
+function genDetail() {
+  const a = new Float32Array(DETAIL_TEX * DETAIL_TEX);
+  const texel = DETAIL_SPAN / DETAIL_TEX;
+  let sum = 0;
+  for (let z = 0; z < DETAIL_TEX; z++) {
+    const wz = (z + 0.5) * texel;
+    for (let x = 0; x < DETAIL_TEX; x++) {
+      const wx = (x + 0.5) * texel;
+      const n = 0.55 * vnT(wx / 0.32, wz / 0.32, 64, 17)
+        + 0.45 * vnT(wx / 0.08, wz / 0.08, 256, 71);
+      const r = sstep(0.40, 0.66, n);
+      a[z * DETAIL_TEX + x] = r;
+      sum += r;
+    }
+  }
+  return { det: a, mean: sum / (DETAIL_TEX * DETAIL_TEX) };
 }
 
 // ---------- WGSL ----------
@@ -162,6 +197,7 @@ struct U {
   par: vec4f,       // grassR0, grassR1, kOpacity, slabH
   grid: vec4f,      // cellSize, gridN, originX, originZ
   misc: vec4f,      // bladesPerCell, rhoMean, geomOn, -
+  misc2: vec4f,     // detailMean, flatGround, -, -
 }
 fn rhoUV(p: vec2f) -> vec2f {
   return (p - vec2f(${REG_MIN}.0)) / ${REG_SPAN}.0;
@@ -173,6 +209,8 @@ const SCENE_WGSL = COMMON + /* wgsl */`
 @group(0) @binding(1) var samp: sampler;
 @group(0) @binding(2) var rhoTex: texture_2d<f32>;
 @group(0) @binding(3) var farr: texture_2d_array<f32>;
+@group(0) @binding(4) var detailArr: texture_2d_array<f32>;
+@group(0) @binding(5) var sampR: sampler;
 
 // --- sky ---
 struct SkyOut { @builtin(position) pos: vec4f, @location(0) ndc: vec2f }
@@ -222,7 +260,9 @@ struct TOut { @builtin(position) pos: vec4f, @location(0) wp: vec3f }
   let rho = mix(u.misc.y, textureSample(rhoTex, samp, uv).r, regFade);
   // groundAlbedo の手続きノイズはミップを持たないため、遠方でモアレになる前に均す
   let dirt = mix(groundAlbedo(wp.xz*0.7), vec3f(0.20, 0.16, 0.10), min(dist*0.01, 1.0));
-  let gAlb = mix(dirt, ROOT_COL*1.4, clamp(rho*0.85 + 0.05, 0.0, 1.0)) * patchTint(wp.xz);
+  var gAlb = mix(dirt, ROOT_COL*1.4, clamp(rho*0.85 + 0.05, 0.0, 1.0)) * patchTint(wp.xz);
+  // 単色地面モード: 方向性レイヤーの効果と地面の色変化を切り分ける検証用
+  if (u.misc2.y > 0.5) { gAlb = vec3f(0.17, 0.14, 0.11); }
   var c = gAlb * (SUN_COL*ndl + SKY_AMB*0.9);
   if (u.sunDir.w > 0.5) {
     // 視線方位に沿ってぼかした密度を引く。方位量子化は隣接2層の lerp
@@ -242,6 +282,13 @@ struct TOut { @builtin(position) pos: vec4f, @location(0) wp: vec3f }
     var rd = mix(u.misc.y, mix(b0, b1, fw), regFade);
     // ぼかしで落ちたコントラストを戻す
     rd = clamp((rd - 0.30) * 1.7 + 0.30, 0.0, 1.3);
+    // 葉幅スケールの縦筋はマクロ密度 (texel 0.5m) では出ないため、
+    // cm スケールのタイル詳細密度 (同じ16方位ぼかし済み) を乗算する
+    let duv = wp.xz / ${DETAIL_SPAN};
+    let d0 = textureSample(detailArr, sampR, duv, i32(i0)).r;
+    let d1 = textureSample(detailArr, sampR, duv, i32(i1)).r;
+    let detN = mix(d0, d1, fw) / max(u.misc2.x, 1e-3);
+    rd = rd * (0.35 + 0.65 * detN);
     // 不透明度: 密度 × グレージングでの見かけ光路長 (足元線分長は固定上限でクランプ)
     let sinG = clamp(abs(dot(V, N)), 0.02, 1.0);
     let L = clamp(u.par.w * sqrt(1.0 - sinG*sinG) / sinG, 0.1, 12.0);
@@ -253,7 +300,8 @@ struct TOut { @builtin(position) pos: vec4f, @location(0) wp: vec3f }
     }
     // 高密度側でも飽和しない線形カーブにして、密草地帯の中の濃淡を残す
     let shade = 1.35 - 0.5 * clamp(rd, 0.0, 1.3);
-    let galb = mix(ROOT_COL, TIP_COL, 0.6) * patchTint(wp.xz) * shade;
+    var galb = mix(ROOT_COL, TIP_COL, 0.6) * shade;
+    if (u.misc2.y < 0.5) { galb *= patchTint(wp.xz); }
     var glit = galb * (SUN_COL*ndl*0.9 + SKY_AMB*0.75);
     glit += TRANS_COL * pow(max(dot(V, u.sunDir.xyz), 0.0), 6.0) * 0.25;
     c = mix(c, glit, alpha);
@@ -353,7 +401,7 @@ struct BU { dir: vec4f }
   return vec4f(x, y, 0.0, 1.0);
 }
 @fragment fn fsBlur(@builtin(position) fc: vec4f) -> @location(0) vec4f {
-  let uv = fc.xy / ${TEX}.0;
+  let uv = fc.xy / vec2f(textureDimensions(src));
   var acc = 0.0;
   var wsum = 0.0;
   for (var t = -8; t <= 8; t++) {
@@ -435,6 +483,26 @@ async function main() {
     magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear',
     addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge', maxAnisotropy: 8,
   });
+  const sampR = device.createSampler({
+    magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear',
+    addressModeU: 'repeat', addressModeV: 'repeat', maxAnisotropy: 8,
+  });
+
+  const { det, mean: detMean } = genDetail();
+  const detMipCount = Math.log2(DETAIL_TEX) + 1;
+  const detailTex = device.createTexture({
+    size: [DETAIL_TEX, DETAIL_TEX], format: 'r16float',
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+  });
+  const detailArr = device.createTexture({
+    size: [DETAIL_TEX, DETAIL_TEX, NDIR], format: 'r16float', mipLevelCount: detMipCount,
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+  });
+  {
+    const h = new Uint16Array(DETAIL_TEX * DETAIL_TEX);
+    for (let i = 0; i < h.length; i++) h[i] = toHalf(det[i]);
+    device.queue.writeTexture({ texture: detailTex }, h, { bytesPerRow: DETAIL_TEX * 2, rowsPerImage: DETAIL_TEX }, [DETAIL_TEX, DETAIL_TEX, 1]);
+  }
 
   // --- 16方向ぼかし + ミップ生成 (GPU) ---
   const t1 = performance.now();
@@ -454,35 +522,39 @@ async function main() {
       primitive: { topology: 'triangle-list' },
     });
     const enc = device.createCommandEncoder();
-    const stepM = 0.7; // ぼかしタップ間隔 [m]。±6タップ、σ≈1.65m
-    for (let dir = 0; dir < NDIR; dir++) {
-      const th = dir * Math.PI / NDIR;
-      const bu = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-      device.queue.writeBuffer(bu, 0, new Float32Array([
-        Math.cos(th) * stepM / REG_SPAN, Math.sin(th) * stepM / REG_SPAN, 0, 0,
-      ]));
-      const bind = device.createBindGroup({
-        layout: blurPipe.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: { buffer: bu } },
-          { binding: 1, resource: rhoTex.createView({ baseMipLevel: 0, mipLevelCount: 1 }) },
-          { binding: 2, resource: samp },
-        ],
-      });
-      const pass = enc.beginRenderPass({
-        colorAttachments: [{
-          view: farrTex.createView({ dimension: '2d', baseMipLevel: 0, mipLevelCount: 1, baseArrayLayer: dir, arrayLayerCount: 1 }),
-          loadOp: 'clear', clearValue: [0, 0, 0, 0], storeOp: 'store',
-        }],
-      });
-      pass.setPipeline(blurPipe);
-      pass.setBindGroup(0, bind);
-      pass.draw(3);
-      pass.end();
-    }
-    const genMips = (tex, layers) => {
+    const blurDirs = (srcTex, dstTex, stepM, span, blurSamp) => {
+      for (let dir = 0; dir < NDIR; dir++) {
+        const th = dir * Math.PI / NDIR;
+        const bu = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        device.queue.writeBuffer(bu, 0, new Float32Array([
+          Math.cos(th) * stepM / span, Math.sin(th) * stepM / span, 0, 0,
+        ]));
+        const bind = device.createBindGroup({
+          layout: blurPipe.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: bu } },
+            { binding: 1, resource: srcTex.createView({ baseMipLevel: 0, mipLevelCount: 1 }) },
+            { binding: 2, resource: blurSamp },
+          ],
+        });
+        const pass = enc.beginRenderPass({
+          colorAttachments: [{
+            view: dstTex.createView({ dimension: '2d', baseMipLevel: 0, mipLevelCount: 1, baseArrayLayer: dir, arrayLayerCount: 1 }),
+            loadOp: 'clear', clearValue: [0, 0, 0, 0], storeOp: 'store',
+          }],
+        });
+        pass.setPipeline(blurPipe);
+        pass.setBindGroup(0, bind);
+        pass.draw(3);
+        pass.end();
+      }
+    };
+    // マクロ: タップ間隔 0.7m ±8。詳細: 0.08m ±8 (葉幅 8cm に対して縦横比 ~8:1 の筋)
+    blurDirs(rhoTex, farrTex, 0.7, REG_SPAN, samp);
+    blurDirs(detailTex, detailArr, 0.08, DETAIL_SPAN, sampR);
+    const genMips = (tex, layers, levels) => {
       for (let layer = 0; layer < layers; layer++) {
-        for (let lv = 1; lv < mipCount; lv++) {
+        for (let lv = 1; lv < levels; lv++) {
           const bind = device.createBindGroup({
             layout: mipPipe.getBindGroupLayout(0),
             entries: [{
@@ -503,8 +575,9 @@ async function main() {
         }
       }
     };
-    genMips(rhoTex, 1);
-    genMips(farrTex, NDIR);
+    genMips(rhoTex, 1, mipCount);
+    genMips(farrTex, NDIR, mipCount);
+    genMips(detailArr, NDIR, detMipCount);
     device.queue.submit([enc.finish()]);
     await device.queue.onSubmittedWorkDone();
   }
@@ -520,9 +593,11 @@ async function main() {
       { binding: 1, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, sampler: {} },
       { binding: 2, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, texture: {} },
       { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { viewDimension: '2d-array' } },
+      { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { viewDimension: '2d-array' } },
+      { binding: 5, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
     ],
   });
-  const uBuf = device.createBuffer({ size: 192, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const uBuf = device.createBuffer({ size: 208, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const bindA = device.createBindGroup({
     layout: layoutA,
     entries: [
@@ -530,6 +605,8 @@ async function main() {
       { binding: 1, resource: samp },
       { binding: 2, resource: rhoTex.createView() },
       { binding: 3, resource: farrTex.createView({ dimension: '2d-array' }) },
+      { binding: 4, resource: detailArr.createView({ dimension: '2d-array' }) },
+      { binding: 5, resource: sampR },
     ],
   });
   const pLayoutA = device.createPipelineLayout({ bindGroupLayouts: [layoutA] });
@@ -599,7 +676,7 @@ async function main() {
   const state = {
     pos: [0, 0, 240], yaw: 0.55, pitch: -0.06,
     keys: new Set(),
-    geomOn: true, barsOn: true, windOn: true, rhoOverlay: false, paused: false,
+    geomOn: true, barsOn: true, windOn: true, rhoOverlay: false, paused: false, flatGround: false,
     bpc: 32, r1: 24, sunAz: 2.4, sunEl: 0.66, kOpacity: 2.0,
     time: 0, fps: 0,
   };
@@ -633,6 +710,7 @@ async function main() {
     if (k === 't') state.rhoOverlay = !state.rhoOverlay;
     if (k === 'v') state.windOn = !state.windOn;
     if (k === 'p') state.paused = !state.paused;
+    if (k === 'n') state.flatGround = !state.flatGround;
     if (k === '1') state.sunAz -= 0.15;
     if (k === '2') state.sunAz += 0.15;
     if (k === '3') state.bpc = Math.max(4, state.bpc / 2);
@@ -668,11 +746,11 @@ async function main() {
       buf.unmap();
       return out;
     },
-    tex: { get rho() { return rhoTex; }, get farr() { return farrTex; } },
+    tex: { get rho() { return rhoTex; }, get farr() { return farrTex; }, get detail() { return detailArr; } },
   };
 
   // --- frame loop ---
-  const uData = new Float32Array(48);
+  const uData = new Float32Array(52);
   let prev = performance.now();
   let fpsAcc = 0, fpsN = 0, fpsT = 0;
 
@@ -743,6 +821,7 @@ async function main() {
     uData.set([state.r1 * 0.7, state.r1, state.kOpacity, SLAB_H], 36);
     uData.set([CELL, GRID_N, ox, oz], 40);
     uData.set([state.bpc, mean, state.geomOn ? 1 : 0, 0], 44);
+    uData.set([detMean, state.flatGround ? 1 : 0, 0, 0], 48);
     device.queue.writeBuffer(uBuf, 0, uData);
 
     const enc = device.createCommandEncoder();
@@ -778,7 +857,7 @@ async function main() {
     hud.textContent =
       `fps ${state.fps.toFixed(0)}  density ${densMs.toFixed(0)}ms  blur16 ${blurMs.toFixed(0)}ms  blades ${(blades / 1000).toFixed(0)}k\n` +
       `geom[G] ${state.geomOn ? 'on' : 'off'}  bars[B] ${state.barsOn ? 'on' : 'off'}  ` +
-      `wind[V] ${state.windOn ? 'on' : 'off'}  rho[T] ${state.rhoOverlay ? 'on' : 'off'}\n` +
+      `wind[V] ${state.windOn ? 'on' : 'off'}  rho[T] ${state.rhoOverlay ? 'on' : 'off'}  flat[N] ${state.flatGround ? 'on' : 'off'}\n` +
       `radius[5/6] ${state.r1}m  density[3/4] ${state.bpc}/cell  opacity[7/8] ${state.kOpacity.toFixed(1)}  sun[1/2] ${(state.sunAz * 180 / Math.PI).toFixed(0)}°\n` +
       `drag:look  WASD:move  R/F:up/down  Shift:fast  P:pause`;
 
