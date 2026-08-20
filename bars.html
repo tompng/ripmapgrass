@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>drawww — grass density-integral (bars) experiment</title>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#000}
+canvas{width:100%;height:100%;display:block;cursor:grab}
+#hud{position:fixed;left:10px;top:10px;color:#fff;font:12px/1.55 ui-monospace,monospace;
+     background:rgba(0,0,0,.45);padding:8px 10px;border-radius:6px;white-space:pre;pointer-events:none}
+#err{position:fixed;inset:0;display:none;place-items:center;color:#f88;font:16px ui-monospace,monospace}
+</style>
+<canvas id="c"></canvas>
+<div id="hud">baking...</div>
+<div id="err"></div>
+<script type="module" src="bars.js"></script>
