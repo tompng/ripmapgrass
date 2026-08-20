@@ -98,9 +98,12 @@ function genDetail() {
     const wz = (z + 0.5) * texel;
     for (let x = 0; x < DETAIL_TEX; x++) {
       const wx = (x + 0.5) * texel;
-      const n = 0.55 * vnT(wx / 0.32, wz / 0.32, 64, 17)
-        + 0.45 * vnT(wx / 0.08, wz / 0.08, 256, 71);
-      const r = sstep(0.40, 0.66, n);
+      // 筋の細さは細オクターブのしきい値処理で決める (合算だと粗オクターブが
+      // しきい値を支配して太い塊になる)。クランプ構造は変調としてだけ掛ける
+      const fine = 0.55 * vnT(wx / 0.064, wz / 0.064, 320, 137)
+        + 0.45 * vnT(wx / 0.128, wz / 0.128, 160, 71);
+      const clump = vnT(wx / 0.32, wz / 0.32, 64, 17);
+      const r = sstep(0.40, 0.62, fine) * (0.35 + 0.65 * sstep(0.35, 0.65, clump));
       a[z * DETAIL_TEX + x] = r;
       sum += r;
     }
@@ -284,7 +287,14 @@ struct TOut { @builtin(position) pos: vec4f, @location(0) wp: vec3f }
     rd = clamp((rd - 0.30) * 1.7 + 0.30, 0.0, 1.3);
     // 葉幅スケールの縦筋はマクロ密度 (texel 0.5m) では出ないため、
     // cm スケールのタイル詳細密度 (同じ16方位ぼかし済み) を乗算する
-    let duv = wp.xz / ${DETAIL_SPAN};
+    var duv = wp.xz / ${DETAIL_SPAN};
+    if (u.camUp.w > 0.5) {
+      // 風: 参照位置のオフセット = 筋全体の平行移動。根元固定のせん断ではないが
+      // 遠景では株の揺らぎとして通る。位相場は近景ブレードの風と同じ式で整合させる
+      let time = u.camPos.w;
+      let wamp = 0.10*sin(time*1.9 + wp.x*0.35 + wp.z*0.22) + 0.05*sin(time*3.7 + wp.z*0.53 + wp.x*0.31);
+      duv += vec2f(0.86, 0.5) * (wamp * 0.6 / ${DETAIL_SPAN});
+    }
     let d0 = textureSample(detailArr, sampR, duv, i32(i0)).r;
     let d1 = textureSample(detailArr, sampR, duv, i32(i1)).r;
     let detN = mix(d0, d1, fw) / max(u.misc2.x, 1e-3);
@@ -481,11 +491,11 @@ async function main() {
 
   const samp = device.createSampler({
     magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear',
-    addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge', maxAnisotropy: 8,
+    addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge', maxAnisotropy: 16,
   });
   const sampR = device.createSampler({
     magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear',
-    addressModeU: 'repeat', addressModeV: 'repeat', maxAnisotropy: 8,
+    addressModeU: 'repeat', addressModeV: 'repeat', maxAnisotropy: 16,
   });
 
   const { det, mean: detMean } = genDetail();
