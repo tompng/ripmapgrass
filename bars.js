@@ -769,7 +769,7 @@ async function main() {
     fpsAcc += dt; fpsN++;
     if ((fpsT += dt) > 0.5) { state.fps = fpsN / fpsAcc; fpsAcc = 0; fpsN = 0; fpsT = 0; }
 
-    const speed = state.keys.has('shift') ? 60 : 12;
+    const speed = state.keys.has('shift') ? 60 : state.keys.has('control') ? 2 : 12;
     const cy = Math.cos(state.yaw), sy = Math.sin(state.yaw);
     let mx = 0, mz = 0, my = 0;
     if (state.keys.has('w')) { mx += sy; mz -= cy; }
