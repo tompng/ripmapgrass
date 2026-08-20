@@ -5,12 +5,13 @@
 // グレージング投影では視線方位に沿った地面のスジが画面上でほぼ鉛直に立つので、
 // 遠景では模様の方向性が合っていれば草に見える、という割り切り。
 
-const NDIR = 16;              // 180° を等分。ぼかしは対称なので逆向きの区別は不要
-const TEX = 2048;
+const NDIR = 32;              // 180° を等分。ぼかしは対称なので逆向きの区別は不要
+const TEX = 4096;
 const REG_MIN = -512, REG_SPAN = 1024;
-// マクロ密度は texel 0.5m で、葉幅スケール (cm) の筋は原理的に出せない。
-// 筋はタイル反復する詳細密度 (2cm/texel) が担う
-const DETAIL_TEX = 1024, DETAIL_SPAN = 20.48;
+// 方向性ぼかしは詳細タイル (1cm/texel) だけが持つ。マクロ密度 (0.25m/texel) を
+// 方向別に持つと 32 方向でメモリが数百 MB 級になる割に、パッチスケールでは
+// 方向の効果がほぼ見えないため
+const DETAIL_TEX = 1024, DETAIL_SPAN = 10.24;
 const SLAB_H = 0.35;
 const TER_EXTENT = 2400, TER_GRID = 512;
 const GRID_N = 100, CELL = 0.5;
@@ -56,24 +57,39 @@ function sstep(a, b, x) {
   return t * t * (3 - 2 * t);
 }
 
+// しきい値処理は 0/1 のベタ塗り領域を作るため使わない。μ±2σ を [0,1] に
+// 線形で広げ (飽和は裾の数%のみ)、全域に連続な濃淡を残す
+function normalizeField(a) {
+  let mu = 0;
+  for (let i = 0; i < a.length; i++) mu += a[i];
+  mu /= a.length;
+  let s2 = 0;
+  for (let i = 0; i < a.length; i++) { const d = a[i] - mu; s2 += d * d; }
+  const sd = Math.sqrt(s2 / a.length) || 1;
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) {
+    const r = Math.min(1, Math.max(0, 0.5 + (a[i] - mu) / (4 * sd)));
+    a[i] = r;
+    sum += r;
+  }
+  return sum / a.length;
+}
+
 function genDensity() {
   const a = new Float32Array(TEX * TEX);
   const texel = REG_SPAN / TEX;
-  let sum = 0;
   for (let z = 0; z < TEX; z++) {
     const wz = REG_MIN + (z + 0.5) * texel;
     for (let x = 0; x < TEX; x++) {
       const wx = REG_MIN + (x + 0.5) * texel;
-      // 最小オクターブの波長はテクセル 0.5m のナイキスト (1m) より十分上に取る
-      const n = 0.45 * vn(wx / 9, wz / 9)
-        + 0.30 * vn(wx / 3.1 + 31.7, wz / 3.1 + 11.1)
-        + 0.25 * vn(wx / 1.9 + 71.3, wz / 1.9 + 47.9);
-      const r = sstep(0.36, 0.60, n);
-      a[z * TEX + x] = r;
-      sum += r;
+      // 最小オクターブの波長はテクセルのナイキスト (0.5m) より十分上に取る
+      a[z * TEX + x] = 0.35 * vn(wx / 9, wz / 9)
+        + 0.28 * vn(wx / 3.1 + 31.7, wz / 3.1 + 11.1)
+        + 0.22 * vn(wx / 1.9 + 71.3, wz / 1.9 + 47.9)
+        + 0.15 * vn(wx / 0.9 + 13.9, wz / 0.9 + 57.1);
     }
   }
-  return { rho: a, mean: sum / (TEX * TEX) };
+  return { rho: a, mean: normalizeField(a) };
 }
 
 function vnT(x, z, period, seed) {
@@ -88,27 +104,21 @@ function vnT(x, z, period, seed) {
   return (a * (1 - u) + b * u) * (1 - v) + (c * (1 - u) + d * u) * v;
 }
 
-// 葉幅〜株幅 (8cm/32cm) スケールのタイル詳細密度。ノイズ格子をタイル周期で
+// 葉幅スケール (最小 4cm) のタイル詳細密度。ノイズ格子をタイル周期で
 // ラップさせてシームレスにする
 function genDetail() {
   const a = new Float32Array(DETAIL_TEX * DETAIL_TEX);
   const texel = DETAIL_SPAN / DETAIL_TEX;
-  let sum = 0;
   for (let z = 0; z < DETAIL_TEX; z++) {
     const wz = (z + 0.5) * texel;
     for (let x = 0; x < DETAIL_TEX; x++) {
       const wx = (x + 0.5) * texel;
-      // 筋の細さは細オクターブのしきい値処理で決める (合算だと粗オクターブが
-      // しきい値を支配して太い塊になる)。クランプ構造は変調としてだけ掛ける
-      const fine = 0.55 * vnT(wx / 0.064, wz / 0.064, 320, 137)
-        + 0.45 * vnT(wx / 0.128, wz / 0.128, 160, 71);
-      const clump = vnT(wx / 0.32, wz / 0.32, 64, 17);
-      const r = sstep(0.40, 0.62, fine) * (0.35 + 0.65 * sstep(0.35, 0.65, clump));
-      a[z * DETAIL_TEX + x] = r;
-      sum += r;
+      a[z * DETAIL_TEX + x] = 0.45 * vnT(wx / 0.04, wz / 0.04, 256, 137)
+        + 0.30 * vnT(wx / 0.08, wz / 0.08, 128, 71)
+        + 0.25 * vnT(wx / 0.32, wz / 0.32, 32, 17);
     }
   }
-  return { det: a, mean: sum / (DETAIL_TEX * DETAIL_TEX) };
+  return { det: a, mean: normalizeField(a) };
 }
 
 // ---------- WGSL ----------
@@ -211,9 +221,8 @@ const SCENE_WGSL = COMMON + /* wgsl */`
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var samp: sampler;
 @group(0) @binding(2) var rhoTex: texture_2d<f32>;
-@group(0) @binding(3) var farr: texture_2d_array<f32>;
-@group(0) @binding(4) var detailArr: texture_2d_array<f32>;
-@group(0) @binding(5) var sampR: sampler;
+@group(0) @binding(3) var detailArr: texture_2d_array<f32>;
+@group(0) @binding(4) var sampR: sampler;
 
 // --- sky ---
 struct SkyOut { @builtin(position) pos: vec4f, @location(0) ndc: vec2f }
@@ -280,13 +289,6 @@ struct TOut { @builtin(position) pos: vec4f, @location(0) wp: vec3f }
     if (i0 > ${NDIR - 1}.5) { i0 = ${NDIR - 1}.0; }
     var i1 = i0 + 1.0;
     if (i1 > ${NDIR - 1}.5) { i1 = 0.0; }
-    let b0 = textureSample(farr, samp, uv, i32(i0)).r;
-    let b1 = textureSample(farr, samp, uv, i32(i1)).r;
-    var rd = mix(u.misc.y, mix(b0, b1, fw), regFade);
-    // ぼかしで落ちたコントラストを戻す
-    rd = clamp((rd - 0.30) * 1.7 + 0.30, 0.0, 1.3);
-    // 葉幅スケールの縦筋はマクロ密度 (texel 0.5m) では出ないため、
-    // cm スケールのタイル詳細密度 (同じ16方位ぼかし済み) を乗算する
     var duv = wp.xz / ${DETAIL_SPAN};
     if (u.camUp.w > 0.5) {
       // 風: 参照位置のオフセット = 筋全体の平行移動。根元固定のせん断ではないが
@@ -298,7 +300,10 @@ struct TOut { @builtin(position) pos: vec4f, @location(0) wp: vec3f }
     let d0 = textureSample(detailArr, sampR, duv, i32(i0)).r;
     let d1 = textureSample(detailArr, sampR, duv, i32(i1)).r;
     let detN = mix(d0, d1, fw) / max(u.misc2.x, 1e-3);
-    rd = rd * (0.35 + 0.65 * detN);
+    // 正規化で潰れた振幅を偏差ゲインで戻す (0 クランプは max で滑らかに回避)
+    let detB = max(1.0 + (detN - 1.0) * 2.4, 0.05);
+    // マクロは無方向の連続密度、方向性は詳細レイヤーが担う
+    var rd = rho * (0.25 + 0.75 * detB);
     // 不透明度: 密度 × グレージングでの見かけ光路長 (足元線分長は固定上限でクランプ)
     let sinG = clamp(abs(dot(V, N)), 0.02, 1.0);
     let L = clamp(u.par.w * sqrt(1.0 - sinG*sinG) / sinG, 0.1, 12.0);
@@ -309,7 +314,7 @@ struct TOut { @builtin(position) pos: vec4f, @location(0) wp: vec3f }
       alpha *= 0.25 + 0.75*smoothstep(u.par.x, u.par.y, distance(wp.xz, u.camPos.xz));
     }
     // 高密度側でも飽和しない線形カーブにして、密草地帯の中の濃淡を残す
-    let shade = 1.35 - 0.5 * clamp(rd, 0.0, 1.3);
+    let shade = 1.35 - 0.52 * min(rd, 2.2);
     var galb = mix(ROOT_COL, TIP_COL, 0.6) * shade;
     if (u.misc2.y < 0.5) { galb *= patchTint(wp.xz); }
     var glit = galb * (SUN_COL*ndl*0.9 + SKY_AMB*0.75);
@@ -368,32 +373,33 @@ struct GOut { @builtin(position) pos: vec4f, @location(0) wp: vec3f, @location(1
   return vec4f(tonemap(c), 1.0);
 }
 
-// --- 16方向ぼかしテクスチャのビューア (4x4 グリッド、赤線が各層のぼかし方向) ---
+// --- 32方向ぼかし詳細テクスチャのビューア (8x4 グリッド、赤線が各層のぼかし方向) ---
 struct OOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f }
 @vertex fn vsOverlay(@builtin(vertex_index) vi: u32) -> OOut {
   let corner = vec2f(f32(vi % 2u), f32((vi / 2u) % 2u));
-  let hw = 0.9 / u.camRight.w;
+  let hw = 1.2 / u.camRight.w;
   var o: OOut;
-  o.pos = vec4f(mix(-hw, hw, corner.x), mix(-0.9, 0.9, corner.y), 0.0, 1.0);
+  o.pos = vec4f(mix(-hw, hw, corner.x), mix(-0.6, 0.6, corner.y), 0.0, 1.0);
   o.uv = vec2f(corner.x, 1.0 - corner.y);
   return o;
 }
 @fragment fn fsOverlay(in: OOut) -> @location(0) vec4f {
-  let tile = min(floor(in.uv * 4.0), vec2f(3.0));
-  let layer = i32(tile.y * 4.0 + tile.x);
-  let tuv = fract(in.uv * 4.0);
-  // 全域を縮小するとぼかし長 (数m) が見えないので、カメラ位置周辺の
-  // 同一領域 (約80m四方) を全タイル共通で拡大表示する
-  let cuv = rhoUV(u.camPos.xz) + (tuv - vec2f(0.5)) * 0.08;
-  let v = textureSampleLevel(farr, samp, cuv, layer, 0.0).r;
-  var c = vec3f(clamp((v - 0.05) * 1.5, 0.0, 1.0)) * vec3f(0.6, 0.8, 0.45);
+  let grid = vec2f(8.0, 4.0);
+  let tile = min(floor(in.uv * grid), grid - vec2f(1.0));
+  let layer = i32(tile.y * 8.0 + tile.x);
+  let tuv = fract(in.uv * grid);
+  // 全域を縮小するとぼかし長 (数十cm) が見えないので、カメラ位置周辺の
+  // 同一領域 (約2.6m四方) を全タイル共通で拡大表示する
+  let cuv = u.camPos.xz / ${DETAIL_SPAN} + (tuv - vec2f(0.5)) * 0.25;
+  let v = textureSampleLevel(detailArr, sampR, cuv, layer, 0.0).r;
+  var c = vec3f(clamp((v - 0.05) * 1.3, 0.0, 1.0)) * vec3f(0.6, 0.8, 0.45);
   let th = f32(layer) * PI / ${NDIR}.0;
   let dirv = vec2f(cos(th), sin(th));
   let p = tuv - vec2f(0.5);
-  if (abs(dot(p, vec2f(-dirv.y, dirv.x))) < 0.008 && abs(dot(p, dirv)) < 0.13) {
+  if (abs(dot(p, vec2f(-dirv.y, dirv.x))) < 0.010 && abs(dot(p, dirv)) < 0.13) {
     c = mix(c, vec3f(1.0, 0.25, 0.2), 0.85);
   }
-  if (min(tuv.x, tuv.y) < 0.008 || max(tuv.x, tuv.y) > 0.992) {
+  if (min(tuv.x, tuv.y) < 0.010 || max(tuv.x, tuv.y) > 0.990) {
     c = vec3f(0.05);
   }
   return vec4f(pow(c, vec3f(1.0/2.2)), 1.0);
@@ -479,10 +485,6 @@ async function main() {
     size: [TEX, TEX], format: 'r16float', mipLevelCount: mipCount,
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
   });
-  const farrTex = device.createTexture({
-    size: [TEX, TEX, NDIR], format: 'r16float', mipLevelCount: mipCount,
-    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
-  });
   {
     const h = new Uint16Array(TEX * TEX);
     for (let i = 0; i < h.length; i++) h[i] = toHalf(rho[i]);
@@ -559,9 +561,8 @@ async function main() {
         pass.end();
       }
     };
-    // マクロ: タップ間隔 0.7m ±8。詳細: 0.08m ±8 (葉幅 8cm に対して縦横比 ~8:1 の筋)
-    blurDirs(rhoTex, farrTex, 0.7, REG_SPAN, samp);
-    blurDirs(detailTex, detailArr, 0.08, DETAIL_SPAN, sampR);
+    // タップ間隔 0.05m ±8 → 葉幅 4cm に対して縦横比 ~10:1 の筋
+    blurDirs(detailTex, detailArr, 0.05, DETAIL_SPAN, sampR);
     const genMips = (tex, layers, levels) => {
       for (let layer = 0; layer < layers; layer++) {
         for (let lv = 1; lv < levels; lv++) {
@@ -586,7 +587,6 @@ async function main() {
       }
     };
     genMips(rhoTex, 1, mipCount);
-    genMips(farrTex, NDIR, mipCount);
     genMips(detailArr, NDIR, detMipCount);
     device.queue.submit([enc.finish()]);
     await device.queue.onSubmittedWorkDone();
@@ -603,8 +603,7 @@ async function main() {
       { binding: 1, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, sampler: {} },
       { binding: 2, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, texture: {} },
       { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { viewDimension: '2d-array' } },
-      { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { viewDimension: '2d-array' } },
-      { binding: 5, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+      { binding: 4, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
     ],
   });
   const uBuf = device.createBuffer({ size: 208, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -614,9 +613,8 @@ async function main() {
       { binding: 0, resource: { buffer: uBuf } },
       { binding: 1, resource: samp },
       { binding: 2, resource: rhoTex.createView() },
-      { binding: 3, resource: farrTex.createView({ dimension: '2d-array' }) },
-      { binding: 4, resource: detailArr.createView({ dimension: '2d-array' }) },
-      { binding: 5, resource: sampR },
+      { binding: 3, resource: detailArr.createView({ dimension: '2d-array' }) },
+      { binding: 4, resource: sampR },
     ],
   });
   const pLayoutA = device.createPipelineLayout({ bindGroupLayouts: [layoutA] });
@@ -756,7 +754,7 @@ async function main() {
       buf.unmap();
       return out;
     },
-    tex: { get rho() { return rhoTex; }, get farr() { return farrTex; }, get detail() { return detailArr; } },
+    tex: { get rho() { return rhoTex; }, get detail() { return detailArr; } },
   };
 
   // --- frame loop ---
@@ -865,7 +863,7 @@ async function main() {
 
     const blades = state.geomOn ? GRID_N * GRID_N * state.bpc : 0;
     hud.textContent =
-      `fps ${state.fps.toFixed(0)}  density ${densMs.toFixed(0)}ms  blur16 ${blurMs.toFixed(0)}ms  blades ${(blades / 1000).toFixed(0)}k\n` +
+      `fps ${state.fps.toFixed(0)}  density ${densMs.toFixed(0)}ms  blur32 ${blurMs.toFixed(0)}ms  blades ${(blades / 1000).toFixed(0)}k\n` +
       `geom[G] ${state.geomOn ? 'on' : 'off'}  bars[B] ${state.barsOn ? 'on' : 'off'}  ` +
       `wind[V] ${state.windOn ? 'on' : 'off'}  rho[T] ${state.rhoOverlay ? 'on' : 'off'}  flat[N] ${state.flatGround ? 'on' : 'off'}\n` +
       `radius[5/6] ${state.r1}m  density[3/4] ${state.bpc}/cell  opacity[7/8] ${state.kOpacity.toFixed(1)}  sun[1/2] ${(state.sunAz * 180 / Math.PI).toFixed(0)}°\n` +
