@@ -259,12 +259,10 @@ struct TOut { @builtin(position) pos: vec4f, @location(0) wp: vec3f }
   o.wp = wp;
   return o;
 }
-@fragment fn fsTerrain(in: TOut) -> @location(0) vec4f {
-  let wp = in.wp;
+// 地面+遠景草オーバーレイ込みの表面色 (フォグ・トーンマップ前)。
+// ジオメトリ草の根元色にも使う
+fn surfaceColor(wp: vec3f, V: vec3f, dist: f32) -> vec3f {
   let N = terrainN(wp.xz);
-  let toF = wp - u.camPos.xyz;
-  let dist = length(toF);
-  let V = toF / dist;
   let uv = rhoUV(wp.xz);
   let edge = max(abs(wp.x), abs(wp.z));
   let regFade = 1.0 - smoothstep(${REG_SPAN / 2 - 40}.0, ${REG_SPAN / 2}.0, edge);
@@ -321,12 +319,19 @@ struct TOut { @builtin(position) pos: vec4f, @location(0) wp: vec3f }
     glit += TRANS_COL * pow(max(dot(V, u.sunDir.xyz), 0.0), 6.0) * 0.25;
     c = mix(c, glit, alpha);
   }
+  return c;
+}
+@fragment fn fsTerrain(in: TOut) -> @location(0) vec4f {
+  let toF = in.wp - u.camPos.xyz;
+  let dist = length(toF);
+  let V = toF / dist;
+  var c = surfaceColor(in.wp, V, dist);
   c = applyFog(c, dist, dot(V, u.sunDir.xyz));
   return vec4f(tonemap(c), 1.0);
 }
 
 // --- geometry grass ---
-struct GOut { @builtin(position) pos: vec4f, @location(0) wp: vec3f, @location(1) tv: vec2f }
+struct GOut { @builtin(position) pos: vec4f, @location(0) wp: vec3f, @location(1) tv: vec2f, @location(2) bxz: vec2f }
 @vertex fn vsGrass(@location(0) vt: vec2f, @builtin(instance_index) ii: u32) -> GOut {
   let bpc = u32(u.misc.x);
   let gridN = u32(u.grid.y);
@@ -360,6 +365,7 @@ struct GOut { @builtin(position) pos: vec4f, @location(0) wp: vec3f, @location(1
   o.pos = u.viewProj * vec4f(p, 1.0);
   o.wp = p;
   o.tv = vec2f(vt.x, bp.varh);
+  o.bxz = vec2f(bx, bz);
   return o;
 }
 @fragment fn fsGrass(in: GOut) -> @location(0) vec4f {
@@ -368,7 +374,11 @@ struct GOut { @builtin(position) pos: vec4f, @location(0) wp: vec3f, @location(1
   let dist = length(toF);
   let V = toF / dist;
   let alb = grassAlbedo(in.tv.x, in.tv.y) * patchTint(in.wp.xz);
-  var c = shadeGrass(alb, N, V, u.sunDir.xyz, in.tv.x, grassAO(in.tv.x));
+  let blade = shadeGrass(alb, N, V, u.sunDir.xyz, in.tv.x, grassAO(in.tv.x));
+  // 下半分は株の根元位置の地面メッシュ色 (遠景草オーバーレイの近距離減衰込み) と
+  // 同色にし、先端側だけ葉本来の色にする
+  let ground = surfaceColor(vec3f(in.bxz.x, in.wp.y, in.bxz.y), V, dist);
+  var c = mix(ground, blade, smoothstep(0.12, 0.75, in.tv.x));
   c = applyFog(c, dist, dot(V, u.sunDir.xyz));
   return vec4f(tonemap(c), 1.0);
 }
@@ -769,8 +779,12 @@ async function main() {
     fpsAcc += dt; fpsN++;
     if ((fpsT += dt) > 0.5) { state.fps = fpsN / fpsAcc; fpsAcc = 0; fpsN = 0; fpsT = 0; }
 
-    const speed = state.keys.has('shift') ? 60 : state.keys.has('control') ? 2 : 12;
+    const speed = state.keys.has('shift') ? 60 : state.keys.has('control') ? 4 : 12;
     const cy = Math.cos(state.yaw), sy = Math.sin(state.yaw);
+    if(state.keys.has('control')) {
+      if (state.keys.has('a')) { state.yaw += 0.006 }
+      if (state.keys.has('d')) { state.yaw -= 0.006 }
+    }
     let mx = 0, mz = 0, my = 0;
     if (state.keys.has('w')) { mx += sy; mz -= cy; }
     if (state.keys.has('s')) { mx -= sy; mz += cy; }
