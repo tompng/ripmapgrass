@@ -179,6 +179,13 @@ fn sliceSample(uc: f32, k: f32, r: f32, gx: vec2f, gy: vec2f) -> vec4f {
   let sB = textureSampleGrad(cacheTex, cacheSamp, vec2f(uc + 0.37, vk + SLICE_HW * (1.0 - 2.0 * fB)), gx, gy);
   return mix(sB, sA, wA);
 }
+fn cacheSample(uc: f32, vc: f32, r: f32, gx: vec2f, gy: vec2f) -> vec4f {
+  let fk = clamp(vc * NSLICE - 0.5, 0.0, NSLICE - 1.0);
+  let k0 = floor(fk);
+  let wk = fk - k0;
+  return mix(sliceSample(uc, k0, r, gx, gy),
+             sliceSample(uc, min(k0 + 1.0, NSLICE - 1.0), r, gx, gy), wk);
+}
 
 @fragment fn fsTerrain(in: TOut) -> @location(0) vec4f {
   let wp = in.wp;
@@ -190,18 +197,25 @@ fn sliceSample(uc: f32, k: f32, r: f32, gx: vec2f, gy: vec2f) -> vec4f {
   let sinG = clamp(abs(dot(V, N)), 0.0, 1.0);
   let phi = asin(sinG);
   let vc = clamp((phi - u.par.z) / (u.par.w - u.par.z), 0.0, 1.0);
-  let uc = dot(wp.xz, vec2f(u.camRight.x, u.camRight.z)) / u.misc.y;
   let r = distance(wp.xz, u.camPos.xz);
-  // ミップ選択用の勾配は、三角波の折り返し不連続を含まない
+  // u はワールド固定の x/z 2系統を、フラグメントごとの視線水平方向の重みでブレンドする
+  // (バイプラナー)。視線方向basisの u だとヨー回転で貼り付けが滑るのに対し、
+  // 各フラグメントへのレイ方向は回転不変なので、回転中もブレンド込みで完全に静止する。
+  let ux = wp.x / u.misc.y;
+  let uz = wp.z / u.misc.y;
+  // ミップ選択用の勾配は、のこぎり波の巻き戻り不連続を含まない
   // 「ワールド距離基準の v」の代理値から取る
-  let proxy = vec2f(uc, r * sin(phi) / ${H_CAP}.0);
-  let pgx = dpdx(proxy);
-  let pgy = dpdy(proxy);
-  let fk = clamp(vc * NSLICE - 0.5, 0.0, NSLICE - 1.0);
-  let k0 = floor(fk);
-  let wk = fk - k0;
-  let s = mix(sliceSample(uc, k0, r, pgx, pgy),
-              sliceSample(uc, min(k0 + 1.0, NSLICE - 1.0), r, pgx, pgy), wk);
+  let vlin = r * sin(phi) / ${H_CAP}.0;
+  let proxyX = vec2f(ux, vlin);
+  let proxyZ = vec2f(uz, vlin);
+  let pxx = dpdx(proxyX);
+  let pxy = dpdy(proxyX);
+  let pzx = dpdx(proxyZ);
+  let pzy = dpdy(proxyZ);
+  let vx4 = V.x*V.x*V.x*V.x;
+  let vz4 = V.z*V.z*V.z*V.z;
+  let wx = (vz4 + 5e-9) / (vx4 + vz4 + 1e-8);
+  let s = cacheSample(ux, vc, r, pxx, pxy) * wx + cacheSample(uz, vc, r, pzx, pzy) * (1.0 - wx);
   // u が視線依存座標のため、テクスチャは奥行き方向の変化を角度(v)しか持たず、
   // 急角度帯で同じ内容がレイ方向に伸びる。ワールドアンカーの coverage 変調で崩す。
   // グレージング角では実際の草も coverage が飽和するので変調しない。
