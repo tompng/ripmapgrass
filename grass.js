@@ -611,7 +611,7 @@ async function main() {
     pos: [0, 0, 240], yaw: 0.55, pitch: -0.06,
     keys: new Set(),
     barsOn: true, windOn: true, rhoOverlay: false, paused: false, flatGround: false,
-    sunAz: 2.4, sunEl: 0.66, kOpacity: 2.0,
+    sunAz: 2.4, sunEl: 0.66, kOpacity: 4.0,
     time: 0, fps: 0,
   };
   state.pos[1] = terrainHJS(0, 240) + 1.7;
