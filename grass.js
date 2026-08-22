@@ -11,6 +11,7 @@ const q = new URLSearchParams(location.search);
 const NDIR = parseInt(q.get('ndir') || '16', 10);   // 180° を等分。ぼかしは対称なので逆向きの区別は不要
 const DETAIL_TEX = parseInt(q.get('dtex') || '256', 10);
 const DETAIL_SPAN = parseFloat(q.get('dspan') || '5');
+const LATTICES = parseInt(q.get('lat') || '2', 10);   // 詳細格子の枚数 (1 or 2)
 const TEX = 4096;
 const REG_MIN = -512, REG_SPAN = 1024;
 // 方向性ぼかしは詳細タイルだけが持つ。マクロ密度 (0.25m/texel) を
@@ -234,6 +235,26 @@ struct TOut { @builtin(position) pos: vec4f, @location(0) wp: vec3f }
   o.wp = wp;
   return o;
 }
+// 1格子ぶんの方向性詳細密度。格子を β 回転して貼る場合、テクスチャ空間で
+// 参照すべきぼかし方位は θ_view − β (筋は貼り付けの回転を経て世界では視線方位に揃う)
+fn latticeDetail(p: vec2f, windW: vec2f, thetaView: f32, beta: f32) -> f32 {
+  var tm = thetaView - beta;
+  tm = tm - floor(tm / PI) * PI;
+  var i0 = floor(tm / (PI / ${NDIR}.0));
+  let fw = tm / (PI / ${NDIR}.0) - i0;
+  if (i0 > ${NDIR - 1}.5) { i0 = ${NDIR - 1}.0; }
+  var i1 = i0 + 1.0;
+  if (i1 > ${NDIR - 1}.5) { i1 = 0.0; }
+  let cb = cos(beta);
+  let sb = sin(beta);
+  let lp = vec2f(cb*p.x + sb*p.y, -sb*p.x + cb*p.y);
+  let lw = vec2f(cb*windW.x + sb*windW.y, -sb*windW.x + cb*windW.y);
+  let duv = (lp + lw) / ${DETAIL_SPAN};
+  let d0 = textureSample(detailArr, sampR, duv, i32(i0)).r;
+  let d1 = textureSample(detailArr, sampR, duv, i32(i1)).r;
+  return mix(d0, d1, fw);
+}
+
 // 地面+遠景草オーバーレイ込みの表面色 (フォグ・トーンマップ前)
 fn surfaceColor(wp: vec3f, V: vec3f, dist: f32) -> vec3f {
   let N = terrainN(wp.xz);
@@ -254,24 +275,21 @@ fn surfaceColor(wp: vec3f, V: vec3f, dist: f32) -> vec3f {
     var rh = V.xz;
     let lh = length(rh);
     rh = select(rh / lh, vec2f(1.0, 0.0), lh < 1e-5);
-    var tm = atan2(rh.y, rh.x);
-    if (tm < 0.0) { tm += PI; }
-    var i0 = floor(tm / (PI / ${NDIR}.0));
-    let fw = tm / (PI / ${NDIR}.0) - i0;
-    if (i0 > ${NDIR - 1}.5) { i0 = ${NDIR - 1}.0; }
-    var i1 = i0 + 1.0;
-    if (i1 > ${NDIR - 1}.5) { i1 = 0.0; }
-    var duv = wp.xz / ${DETAIL_SPAN};
+    let thetaView = atan2(rh.y, rh.x);
+    var windW = vec2f(0.0);
     if (u.camUp.w > 0.5) {
       // 風: 参照位置のオフセット = 筋全体の平行移動。根元固定のせん断ではないが
       // 遠景では株の揺らぎとして通る。位相場は近景ブレードの風と同じ式で整合させる
       let time = u.camPos.w;
       let wamp = 0.10*sin(time*1.9 + wp.x*0.35 + wp.z*0.22) + 0.05*sin(time*3.7 + wp.z*0.53 + wp.x*0.31);
-      duv += vec2f(0.86, 0.5) * (wamp * 0.6 / ${DETAIL_SPAN});
+      windW = vec2f(0.86, 0.5) * (wamp * 0.6);
     }
-    let d0 = textureSample(detailArr, sampR, duv, i32(i0)).r;
-    let d1 = textureSample(detailArr, sampR, duv, i32(i1)).r;
-    let detN = mix(d0, d1, fw) / max(u.par.w, 1e-3);
+    // 2格子を半量子 (π/2NDIR) 回転差で重ねる: 回転角が格子と非通約なので合成場は
+    // 非周期になり、方向量子化の誤差も格子間で非相関化される
+    var dsum = latticeDetail(wp.xz, windW, thetaView, 0.0);
+    ${LATTICES === 2 ? `dsum = (dsum + latticeDetail(wp.xz, windW, thetaView, ${Math.PI / (2 * NDIR)})) * 0.5;` : ''}
+    // 独立場の平均で落ちた分散を偏差スケールで戻す
+    let detN = 1.0 + (dsum / max(u.par.w, 1e-3) - 1.0) * ${LATTICES === 2 ? Math.SQRT2 : 1.0};
     // 正規化で潰れた振幅を偏差ゲインで戻す (0 クランプは max で滑らかに回避)
     let detB = max(1.0 + (detN - 1.0) * 2.4, 0.05);
     // マクロは無方向の連続密度、方向性は詳細レイヤーが担う
@@ -759,7 +777,7 @@ async function main() {
     const detMB = DETAIL_TEX * DETAIL_TEX * NDIR * 2 * 4 / 3 / 1048576;
     hud.textContent =
       `fps ${state.fps.toFixed(0)}  density ${densMs.toFixed(0)}ms  blur ${blurMs.toFixed(0)}ms\n` +
-      `ndir ${NDIR}  dtex ${DETAIL_TEX}px / dspan ${DETAIL_SPAN}m (${(DETAIL_SPAN / DETAIL_TEX * 100).toFixed(1)}cm/texel)  mem ${detMB.toFixed(1)}MB\n` +
+      `ndir ${NDIR}  lat ${LATTICES}  dtex ${DETAIL_TEX}px / dspan ${DETAIL_SPAN}m (${(DETAIL_SPAN / DETAIL_TEX * 100).toFixed(1)}cm/texel)  mem ${detMB.toFixed(1)}MB\n` +
       `bars[B] ${state.barsOn ? 'on' : 'off'}  wind[V] ${state.windOn ? 'on' : 'off'}  ` +
       `viewer[T] ${state.rhoOverlay ? 'on' : 'off'}  flat[N] ${state.flatGround ? 'on' : 'off'}\n` +
       `opacity[7/8] ${state.kOpacity.toFixed(1)}  sun[1/2] ${(state.sunAz * 180 / Math.PI).toFixed(0)}°\n` +
