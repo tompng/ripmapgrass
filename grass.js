@@ -6,12 +6,11 @@
 // 遠景では模様の方向性が合っていれば草に見える、という割り切り。
 
 // 実験用ノブ: ?ndir=16&dtex=512&dspan=5.12 のように URL パラメータで変更できる
-// (dtex は 2 の冪)
+// (dtex は 2 の冪)。詳細格子は常に2枚 (半量子回転差) 重ねる
 const q = new URLSearchParams(location.search);
-const NDIR = parseInt(q.get('ndir') || '16', 10);   // 180° を等分。ぼかしは対称なので逆向きの区別は不要
+const NDIR = parseInt(q.get('ndir') || '12', 10);   // 180° を等分。ぼかしは対称なので逆向きの区別は不要
 const DETAIL_TEX = parseInt(q.get('dtex') || '256', 10);
 const DETAIL_SPAN = parseFloat(q.get('dspan') || '5');
-const LATTICES = parseInt(q.get('lat') || '2', 10);   // 詳細格子の枚数 (1 or 2)
 const TEX = 4096;
 const REG_MIN = -512, REG_SPAN = 1024;
 // 方向性ぼかしは詳細タイルだけが持つ。マクロ密度 (0.25m/texel) を
@@ -285,11 +284,12 @@ fn surfaceColor(wp: vec3f, V: vec3f, dist: f32) -> vec3f {
       windW = vec2f(0.86, 0.5) * (wamp * 0.6);
     }
     // 2格子を半量子 (π/2NDIR) 回転差で重ねる: 回転角が格子と非通約なので合成場は
-    // 非周期になり、方向量子化の誤差も格子間で非相関化される
-    var dsum = latticeDetail(wp.xz, windW, thetaView, 0.0);
-    ${LATTICES === 2 ? `dsum = (dsum + latticeDetail(wp.xz, windW, thetaView, ${Math.PI / (2 * NDIR)})) * 0.5;` : ''}
-    // 独立場の平均で落ちた分散を偏差スケールで戻す
-    let detN = 1.0 + (dsum / max(u.par.w, 1e-3) - 1.0) * ${LATTICES === 2 ? Math.SQRT2 : 1.0};
+    // 非周期になり、方向量子化の誤差も格子間で非相関化される。
+    // 2枚の和 (÷2) を表現したい場そのものとみなし、分散の √2 復元はしない
+    // (復元すると最大値が範囲を超え、濃部にベタ塗りが出る)
+    let dsum = (latticeDetail(wp.xz, windW, thetaView, 0.0)
+              + latticeDetail(wp.xz, windW, thetaView, ${Math.PI / (2 * NDIR)})) * 0.5;
+    let detN = dsum / max(u.par.w, 1e-3);
     // 正規化で潰れた振幅を偏差ゲインで戻す (0 クランプは max で滑らかに回避)
     let detB = max(1.0 + (detN - 1.0) * 2.4, 0.05);
     // マクロは無方向の連続密度、方向性は詳細レイヤーが担う
@@ -777,7 +777,7 @@ async function main() {
     const detMB = DETAIL_TEX * DETAIL_TEX * NDIR * 2 * 4 / 3 / 1048576;
     hud.textContent =
       `fps ${state.fps.toFixed(0)}  density ${densMs.toFixed(0)}ms  blur ${blurMs.toFixed(0)}ms\n` +
-      `ndir ${NDIR}  lat ${LATTICES}  dtex ${DETAIL_TEX}px / dspan ${DETAIL_SPAN}m (${(DETAIL_SPAN / DETAIL_TEX * 100).toFixed(1)}cm/texel)  mem ${detMB.toFixed(1)}MB\n` +
+      `ndir ${NDIR}  dtex ${DETAIL_TEX}px / dspan ${DETAIL_SPAN}m (${(DETAIL_SPAN / DETAIL_TEX * 100).toFixed(1)}cm/texel)  mem ${detMB.toFixed(1)}MB\n` +
       `bars[B] ${state.barsOn ? 'on' : 'off'}  wind[V] ${state.windOn ? 'on' : 'off'}  ` +
       `viewer[T] ${state.rhoOverlay ? 'on' : 'off'}  flat[N] ${state.flatGround ? 'on' : 'off'}\n` +
       `opacity[7/8] ${state.kOpacity.toFixed(1)}  sun[1/2] ${(state.sunAz * 180 / Math.PI).toFixed(0)}°\n` +
