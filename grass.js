@@ -5,13 +5,17 @@
 // グレージング投影では視線方位に沿った地面のスジが画面上でほぼ鉛直に立つので、
 // 遠景では模様の方向性が合っていれば草に見える、という割り切り。
 
-const NDIR = 32;              // 180° を等分。ぼかしは対称なので逆向きの区別は不要
+// 実験用ノブ: ?ndir=16&dtex=512&dspan=5.12 のように URL パラメータで変更できる
+// (dtex は 2 の冪)
+const q = new URLSearchParams(location.search);
+const NDIR = parseInt(q.get('ndir') || '32', 10);   // 180° を等分。ぼかしは対称なので逆向きの区別は不要
+const DETAIL_TEX = parseInt(q.get('dtex') || '1024', 10);
+const DETAIL_SPAN = parseFloat(q.get('dspan') || '10.24');
 const TEX = 4096;
 const REG_MIN = -512, REG_SPAN = 1024;
-// 方向性ぼかしは詳細タイル (1cm/texel) だけが持つ。マクロ密度 (0.25m/texel) を
+// 方向性ぼかしは詳細タイルだけが持つ。マクロ密度 (0.25m/texel) を
 // 方向別に持つと 32 方向でメモリが数百 MB 級になる割に、パッチスケールでは
 // 方向の効果がほぼ見えないため
-const DETAIL_TEX = 1024, DETAIL_SPAN = 10.24;
 const SLAB_H = 0.35;
 const TER_EXTENT = 2400, TER_GRID = 512;
 
@@ -103,24 +107,31 @@ function vnT(x, z, period, seed) {
   return (a * (1 - u) + b * u) * (1 - v) + (c * (1 - u) + d * u) * v;
 }
 
-// 葉幅スケール (最小 4cm) のタイル詳細密度。ノイズ格子をタイル周期で
-// ラップさせてシームレスにする
+// 葉幅スケール (最小 ~4cm) のタイル詳細密度。ノイズ格子をタイル周期で
+// ラップさせてシームレスにする。格子周期は DETAIL_SPAN の整数分割に丸めて
+// 任意の dspan でも周期性を保つ
 function genDetail() {
   const a = new Float32Array(DETAIL_TEX * DETAIL_TEX);
   const texel = DETAIL_SPAN / DETAIL_TEX;
+  const p1 = Math.round(DETAIL_SPAN / 0.04);
+  const p2 = Math.round(DETAIL_SPAN / 0.08);
+  const p3 = Math.round(DETAIL_SPAN / 0.32);
   for (let z = 0; z < DETAIL_TEX; z++) {
     const wz = (z + 0.5) * texel;
     for (let x = 0; x < DETAIL_TEX; x++) {
       const wx = (x + 0.5) * texel;
-      a[z * DETAIL_TEX + x] = 0.45 * vnT(wx / 0.04, wz / 0.04, 256, 137)
-        + 0.30 * vnT(wx / 0.08, wz / 0.08, 128, 71)
-        + 0.25 * vnT(wx / 0.32, wz / 0.32, 32, 17);
+      a[z * DETAIL_TEX + x] = 0.45 * vnT(wx * p1 / DETAIL_SPAN, wz * p1 / DETAIL_SPAN, p1, 137)
+        + 0.30 * vnT(wx * p2 / DETAIL_SPAN, wz * p2 / DETAIL_SPAN, p2, 71)
+        + 0.25 * vnT(wx * p3 / DETAIL_SPAN, wz * p3 / DETAIL_SPAN, p3, 17);
     }
   }
   return { det: a, mean: normalizeField(a) };
 }
 
 // ---------- WGSL ----------
+
+const OV_COLS = NDIR > 16 ? 8 : 4;
+const OV_ROWS = Math.ceil(NDIR / OV_COLS);
 
 const COMMON = /* wgsl */`
 const PI = 3.141592653589793;
@@ -293,16 +304,17 @@ fn surfaceColor(wp: vec3f, V: vec3f, dist: f32) -> vec3f {
 struct OOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f }
 @vertex fn vsOverlay(@builtin(vertex_index) vi: u32) -> OOut {
   let corner = vec2f(f32(vi % 2u), f32((vi / 2u) % 2u));
-  let hw = 1.2 / u.camRight.w;
+  let hw = ${OV_COLS}.0 * 0.15 / u.camRight.w;
+  let hh = ${OV_ROWS}.0 * 0.15;
   var o: OOut;
-  o.pos = vec4f(mix(-hw, hw, corner.x), mix(-0.6, 0.6, corner.y), 0.0, 1.0);
+  o.pos = vec4f(mix(-hw, hw, corner.x), mix(-hh, hh, corner.y), 0.0, 1.0);
   o.uv = vec2f(corner.x, 1.0 - corner.y);
   return o;
 }
 @fragment fn fsOverlay(in: OOut) -> @location(0) vec4f {
-  let grid = vec2f(8.0, 4.0);
+  let grid = vec2f(${OV_COLS}.0, ${OV_ROWS}.0);
   let tile = min(floor(in.uv * grid), grid - vec2f(1.0));
-  let layer = i32(tile.y * 8.0 + tile.x);
+  let layer = min(i32(tile.y * ${OV_COLS}.0 + tile.x), ${NDIR - 1});
   let tuv = fract(in.uv * grid);
   // 全域を縮小するとぼかし長 (数十cm) が見えないので、カメラ位置周辺の
   // 同一領域 (約2.6m四方) を全タイル共通で拡大表示する
@@ -744,8 +756,10 @@ async function main() {
     pass.end();
     device.queue.submit([enc.finish()]);
 
+    const detMB = DETAIL_TEX * DETAIL_TEX * NDIR * 2 * 4 / 3 / 1048576;
     hud.textContent =
       `fps ${state.fps.toFixed(0)}  density ${densMs.toFixed(0)}ms  blur ${blurMs.toFixed(0)}ms\n` +
+      `ndir ${NDIR}  dtex ${DETAIL_TEX}px / dspan ${DETAIL_SPAN}m (${(DETAIL_SPAN / DETAIL_TEX * 100).toFixed(1)}cm/texel)  mem ${detMB.toFixed(1)}MB\n` +
       `bars[B] ${state.barsOn ? 'on' : 'off'}  wind[V] ${state.windOn ? 'on' : 'off'}  ` +
       `viewer[T] ${state.rhoOverlay ? 'on' : 'off'}  flat[N] ${state.flatGround ? 'on' : 'off'}\n` +
       `opacity[7/8] ${state.kOpacity.toFixed(1)}  sun[1/2] ${(state.sunAz * 180 / Math.PI).toFixed(0)}°\n` +
