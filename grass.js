@@ -8,9 +8,9 @@
 // 実験用ノブ: ?ndir=16&dtex=512&dspan=5.12 のように URL パラメータで変更できる
 // (dtex は 2 の冪)
 const q = new URLSearchParams(location.search);
-const NDIR = parseInt(q.get('ndir') || '32', 10);   // 180° を等分。ぼかしは対称なので逆向きの区別は不要
-const DETAIL_TEX = parseInt(q.get('dtex') || '1024', 10);
-const DETAIL_SPAN = parseFloat(q.get('dspan') || '10.24');
+const NDIR = parseInt(q.get('ndir') || '16', 10);   // 180° を等分。ぼかしは対称なので逆向きの区別は不要
+const DETAIL_TEX = parseInt(q.get('dtex') || '256', 10);
+const DETAIL_SPAN = parseFloat(q.get('dspan') || '5');
 const TEX = 4096;
 const REG_MIN = -512, REG_SPAN = 1024;
 // 方向性ぼかしは詳細タイルだけが持つ。マクロ密度 (0.25m/texel) を
