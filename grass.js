@@ -242,16 +242,14 @@ fn latticeDetail(p: vec2f, windW: vec2f, thetaView: f32, beta: f32) -> f32 {
   var i0 = floor(tm / (PI / ${NDIR}.0));
   let fw = tm / (PI / ${NDIR}.0) - i0;
   if (i0 > ${NDIR - 1}.5) { i0 = ${NDIR - 1}.0; }
-  var i1 = i0 + 1.0;
-  if (i1 > ${NDIR - 1}.5) { i1 = 0.0; }
   let cb = cos(beta);
   let sb = sin(beta);
   let lp = vec2f(cb*p.x + sb*p.y, -sb*p.x + cb*p.y);
   let lw = vec2f(cb*windW.x + sb*windW.y, -sb*windW.x + cb*windW.y);
   let duv = (lp + lw) / ${DETAIL_SPAN};
-  let d0 = textureSample(detailArr, sampR, duv, i32(i0)).r;
-  let d1 = textureSample(detailArr, sampR, duv, i32(i1)).r;
-  return mix(d0, d1, fw);
+  // レイヤー i の rg には方位 (i, i+1) がペアで焼いてあるので、補間に要る隣接2方位が 1 fetch で揃う
+  let d = textureSample(detailArr, sampR, duv, i32(i0)).rg;
+  return mix(d.x, d.y, fw);
 }
 
 // 地面+遠景草オーバーレイ込みの表面色 (フォグ・トーンマップ前)
@@ -269,7 +267,7 @@ fn surfaceColor(wp: vec3f, V: vec3f, dist: f32) -> vec3f {
   if (u.misc.x > 0.5) { gAlb = vec3f(0.17, 0.14, 0.11); }
   var c = gAlb * (SUN_COL*ndl + SKY_AMB*0.9);
   if (u.sunDir.w > 0.5) {
-    // 視線方位に沿ってぼかした密度を引く。方位量子化は隣接2層の lerp
+    // 視線方位に沿ってぼかした密度を引く。方位量子化は隣接2方位の lerp
     // (ぼかしは対称なので 180° 周期、符号処理は不要)
     var rh = V.xz;
     let lh = length(rh);
@@ -364,14 +362,16 @@ struct BU { dir: vec4f }
 }
 @fragment fn fsBlur(@builtin(position) fc: vec4f) -> @location(0) vec4f {
   let uv = fc.xy / vec2f(textureDimensions(src));
-  var acc = 0.0;
+  var acc = vec2f(0.0);
   var wsum = 0.0;
   for (var t = -8; t <= 8; t++) {
     let w = exp(-f32(t*t) * 0.05);
-    acc += textureSampleLevel(src, s2, uv + bu.dir.xy * f32(t), 0.0).r * w;
+    acc += vec2f(
+      textureSampleLevel(src, s2, uv + bu.dir.xy * f32(t), 0.0).r,
+      textureSampleLevel(src, s2, uv + bu.dir.zw * f32(t), 0.0).r) * w;
     wsum += w;
   }
-  return vec4f(acc / wsum, 0.0, 0.0, 1.0);
+  return vec4f(acc / wsum, 0.0, 1.0);
 }
 @fragment fn fsMip(@builtin(position) fc: vec4f) -> @location(0) vec4f {
   let dim = textureDimensions(src);
@@ -452,8 +452,10 @@ async function main() {
     size: [DETAIL_TEX, DETAIL_TEX], format: 'r16float',
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
   });
+  // レイヤー i の rg = 方位 (i, i+1) のペア。g は次レイヤーの r と同値の重複だが、
+  // サンプリング側の方位補間が 1 fetch になる
   const detailArr = device.createTexture({
-    size: [DETAIL_TEX, DETAIL_TEX, NDIR], format: 'r16float', mipLevelCount: detMipCount,
+    size: [DETAIL_TEX, DETAIL_TEX, NDIR], format: 'rg16float', mipLevelCount: detMipCount,
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
   });
   {
@@ -467,25 +469,25 @@ async function main() {
   device.pushErrorScope('validation');
   {
     const blurMod = device.createShaderModule({ code: BLUR_WGSL });
-    const blurPipe = device.createRenderPipeline({
+    const mkPipe = (entryPoint, format) => device.createRenderPipeline({
       layout: 'auto',
       vertex: { module: blurMod, entryPoint: 'vsFull' },
-      fragment: { module: blurMod, entryPoint: 'fsBlur', targets: [{ format: 'r16float' }] },
+      fragment: { module: blurMod, entryPoint, targets: [{ format }] },
       primitive: { topology: 'triangle-list' },
     });
-    const mipPipe = device.createRenderPipeline({
-      layout: 'auto',
-      vertex: { module: blurMod, entryPoint: 'vsFull' },
-      fragment: { module: blurMod, entryPoint: 'fsMip', targets: [{ format: 'r16float' }] },
-      primitive: { topology: 'triangle-list' },
-    });
+    const blurPipe = mkPipe('fsBlur', 'rg16float');
+    const mipPipeR = mkPipe('fsMip', 'r16float');
+    const mipPipeRG = mkPipe('fsMip', 'rg16float');
     const enc = device.createCommandEncoder();
+    // dir.xy に方位 i、dir.zw に方位 i+1 (i+1 = NDIR は θ=π で、ぼかしの対称性により方位 0 と同じ)
     const blurDirs = (srcTex, dstTex, stepM, span, blurSamp) => {
       for (let dir = 0; dir < NDIR; dir++) {
-        const th = dir * Math.PI / NDIR;
+        const th0 = dir * Math.PI / NDIR;
+        const th1 = (dir + 1) * Math.PI / NDIR;
         const bu = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
         device.queue.writeBuffer(bu, 0, new Float32Array([
-          Math.cos(th) * stepM / span, Math.sin(th) * stepM / span, 0, 0,
+          Math.cos(th0) * stepM / span, Math.sin(th0) * stepM / span,
+          Math.cos(th1) * stepM / span, Math.sin(th1) * stepM / span,
         ]));
         const bind = device.createBindGroup({
           layout: blurPipe.getBindGroupLayout(0),
@@ -509,7 +511,7 @@ async function main() {
     };
     // タップ間隔 0.05m ±8 → 葉幅 4cm に対して縦横比 ~10:1 の筋
     blurDirs(detailTex, detailArr, 0.05, DETAIL_SPAN, sampR);
-    const genMips = (tex, layers, levels) => {
+    const genMips = (tex, layers, levels, mipPipe) => {
       for (let layer = 0; layer < layers; layer++) {
         for (let lv = 1; lv < levels; lv++) {
           const bind = device.createBindGroup({
@@ -532,8 +534,8 @@ async function main() {
         }
       }
     };
-    genMips(rhoTex, 1, mipCount);
-    genMips(detailArr, NDIR, detMipCount);
+    genMips(rhoTex, 1, mipCount, mipPipeR);
+    genMips(detailArr, NDIR, detMipCount, mipPipeRG);
     device.queue.submit([enc.finish()]);
     await device.queue.onSubmittedWorkDone();
   }
@@ -657,16 +659,18 @@ async function main() {
       state.pos = [x, y, z]; state.yaw = yaw; state.pitch = pitch;
     },
     terrainH: terrainHJS,
+    // rg16float はテクセルあたり half が2つ返る (r,g 交互のフラット配列)
     async readTex(tex, layer, x, y, w) {
-      const buf = device.createBuffer({ size: Math.max(w * 2, 256), usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      const bpt = tex.format === 'rg16float' ? 4 : 2;
+      const buf = device.createBuffer({ size: Math.max(w * bpt, 256), usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
       const enc = device.createCommandEncoder();
       enc.copyTextureToBuffer(
         { texture: tex, origin: [x, y, layer] },
-        { buffer: buf, bytesPerRow: Math.max(w * 2, 256) },
+        { buffer: buf, bytesPerRow: Math.max(w * bpt, 256) },
         [w, 1, 1]);
       device.queue.submit([enc.finish()]);
       await buf.mapAsync(GPUMapMode.READ);
-      const h = new Uint16Array(buf.getMappedRange().slice(0, w * 2));
+      const h = new Uint16Array(buf.getMappedRange().slice(0, w * bpt));
       const out = [...h].map(v => {
         const s = (v & 0x8000) ? -1 : 1, e = (v >> 10) & 0x1f, m = v & 0x3ff;
         if (e === 0) return s * m * Math.pow(2, -24);
@@ -774,7 +778,7 @@ async function main() {
     pass.end();
     device.queue.submit([enc.finish()]);
 
-    const detMB = DETAIL_TEX * DETAIL_TEX * NDIR * 2 * 4 / 3 / 1048576;
+    const detMB = DETAIL_TEX * DETAIL_TEX * NDIR * 4 * 4 / 3 / 1048576;
     hud.textContent =
       `fps ${state.fps.toFixed(0)}  density ${densMs.toFixed(0)}ms  blur ${blurMs.toFixed(0)}ms\n` +
       `ndir ${NDIR}  dtex ${DETAIL_TEX}px / dspan ${DETAIL_SPAN}m (${(DETAIL_SPAN / DETAIL_TEX * 100).toFixed(1)}cm/texel)  mem ${detMB.toFixed(1)}MB\n` +
