@@ -19,6 +19,20 @@ const REG_MIN = -512, REG_SPAN = 1024;
 const SLAB_H = 0.35;
 const TER_EXTENT = 2400, TER_GRID = 512;
 
+// 近景ジオメトリ草 (回転楕円体インポスター)。チャンク 4m 四方 = 0.5m セル 8×8、
+// 1 チャンクのインスタンス添字は k (セル内何本目) 優先で、遠いチャンクほど先頭の
+// 一部だけ描く (prefix 描画)。チャンクの識別は firstInstance に乗せる
+const G_CHUNK = 4, G_CELLS = 8;
+const G_CELL = G_CHUNK / G_CELLS;
+const G_MAX_BPC = 32;
+const G_MAX_INST = G_CELLS * G_CELLS * G_MAX_BPC;
+const G_MAX_CHUNKS = 4096;
+// 1 本ごとの σ フェードにかける生存順位の幅 (順位間隔の何倍か)
+const G_BAND = 2;
+
+// 楕円体中心の根元からの高さ (半長軸比)。1 未満なら下部が地中に沈み、地面で切れる
+const G_CF = parseFloat(q.get('gcf') || '0.75');
+
 const hud = document.getElementById('hud');
 const canvas = document.getElementById('c');
 
@@ -137,6 +151,17 @@ const COMMON = /* wgsl */`
 const PI = 3.141592653589793;
 fn h11(n: f32) -> f32 { return fract(sin(n) * 43758.5453123); }
 fn h21(p: vec2f) -> f32 { return fract(sin(dot(p, vec2f(127.1, 311.7))) * 43758.5453123); }
+fn hashU(x: u32) -> u32 {
+  var h = x;
+  h ^= h >> 16u; h *= 0x7feb352du;
+  h ^= h >> 15u; h *= 0x846ca68bu;
+  h ^= h >> 16u;
+  return h;
+}
+fn hash3f(a: i32, b: i32, c: i32) -> f32 {
+  let h = hashU((bitcast<u32>(a) * 0x9E3779B1u) ^ hashU((bitcast<u32>(b) * 0x85EBCA77u) ^ hashU(bitcast<u32>(c))));
+  return f32(h) / 4294967296.0;
+}
 
 fn terrainH(p: vec2f) -> f32 {
   return 30.0*sin(p.x*0.0157)*sin(p.y*0.0157)
@@ -151,6 +176,24 @@ fn terrainN(p: vec2f) -> vec3f {
          - 4.0*0.04*sin(p.x*0.05 + 1.0)*sin(p.y*0.04)
          - 0.8*0.17*sin(p.x*0.21)*sin(p.y*0.17);
   return normalize(vec3f(-dx, 1.0, -dz));
+}
+
+// 地形メッシュと同じ三角形分割で補間した高さ。解析的 terrainH はメッシュ面から
+// 10cm 前後ずれるので、草の根元はこちらに置く
+fn meshH(p: vec2f) -> f32 {
+  let g = (p / ${TER_EXTENT}.0 + 0.5) * ${TER_GRID}.0;
+  let g0 = floor(g);
+  let f = g - g0;
+  let s = ${TER_EXTENT / TER_GRID};
+  let p0 = (g0 / ${TER_GRID}.0 - 0.5) * ${TER_EXTENT}.0;
+  let h00 = terrainH(p0);
+  let h10 = terrainH(p0 + vec2f(s, 0.0));
+  let h01 = terrainH(p0 + vec2f(0.0, s));
+  let h11 = terrainH(p0 + vec2f(s, s));
+  if (f.x + f.y < 1.0) {
+    return h00 + (h10 - h00)*f.x + (h01 - h00)*f.y;
+  }
+  return h11 + (h01 - h11)*(1.0 - f.x) + (h10 - h11)*(1.0 - f.y);
 }
 
 const ROOT_COL  = vec3f(0.09, 0.19, 0.04);
@@ -186,6 +229,8 @@ struct U {
   sunDir: vec4f,    // w: barsOn
   par: vec4f,       // kOpacity, slabH, rhoMean, detailMean
   misc: vec4f,      // flatGround, -, -, -
+  geo: vec4f,       // 密度フェード開始距離, 終了距離, bladesPerCell, sigma (葉の光学的厚さ)
+  geo2: vec4f,      // height, width, 株の密度ゲイン (色の明暗), dither
 }
 fn rhoUV(p: vec2f) -> vec2f {
   return (p - vec2f(${REG_MIN}.0)) / ${REG_SPAN}.0;
@@ -198,6 +243,7 @@ const SCENE_WGSL = COMMON + /* wgsl */`
 @group(0) @binding(2) var rhoTex: texture_2d<f32>;
 @group(0) @binding(3) var detailArr: texture_2d_array<f32>;
 @group(0) @binding(4) var sampR: sampler;
+@group(0) @binding(5) var<storage, read> chunks: array<vec4f>;  // ox, oz, cx, cz
 
 // --- sky ---
 struct SkyOut { @builtin(position) pos: vec4f, @location(0) ndc: vec2f }
@@ -246,7 +292,8 @@ fn latticeDetail(p: vec2f, windW: vec2f, thetaView: f32, beta: f32) -> f32 {
   let sb = sin(beta);
   let lp = vec2f(cb*p.x + sb*p.y, -sb*p.x + cb*p.y);
   let lw = vec2f(cb*windW.x + sb*windW.y, -sb*windW.x + cb*windW.y);
-  let duv = (lp + lw) / ${DETAIL_SPAN};
+  // 参照点を p − w にすると模様は +w 方向へ動く (ジオメトリ草の先端と同じ向き)
+  let duv = (lp - lw) / ${DETAIL_SPAN};
   // レイヤー i の rg には方位 (i, i+1) がペアで焼いてあるので、補間に要る隣接2方位が 1 fetch で揃う
   let d = textureSample(detailArr, sampR, duv, i32(i0)).rg;
   return mix(d.x, d.y, fw);
@@ -314,6 +361,142 @@ fn surfaceColor(wp: vec3f, V: vec3f, dist: f32) -> vec3f {
   var c = surfaceColor(in.wp, V, dist);
   c = applyFog(c, dist, dot(V, u.sunDir.xyz));
   return vec4f(tonemap(c), 1.0);
+}
+
+// --- 近景ジオメトリ草: 回転楕円体インポスター ---
+// 偽草の「一様色の鉛直な棒」モデルに合わせ、1本を鉛直軸まわりに対称な回転楕円体で描く。
+// 立体なのでビルボードでも回り込みで形が変わらず、レイの通過長から縁が柔らかく出る
+struct GOut {
+  @builtin(position) pos: vec4f,
+  @location(0) wp: vec3f,
+  @location(1) center: vec3f,
+  @location(2) axis: vec3f,
+  @location(3) prm: vec4f,   // 半長軸 a, 半径 r, sigma, -
+  @location(4) col: vec3f,
+}
+fn densAt(d: f32) -> f32 { return 1.0 - smoothstep(u.geo.x, u.geo.y, d); }
+
+@vertex fn vsGrass(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> GOut {
+  let slot = ii / ${G_MAX_INST}u;
+  let li = ii % ${G_MAX_INST}u;
+  let ch = chunks[slot];
+  let cell = li % ${G_CELLS * G_CELLS}u;
+  let k = li / ${G_CELLS * G_CELLS}u;
+  let ci = i32(cell % ${G_CELLS}u);
+  let cj = i32(cell / ${G_CELLS}u);
+  // 乱数はワールドセル座標から: カメラ追従で描画範囲が動いても同じ場所には同じ草
+  let gx = i32(ch.z) * ${G_CELLS} + ci;
+  let gz = i32(ch.w) * ${G_CELLS} + cj;
+  let ki = i32(k);
+  let h0 = hash3f(gx, gz, ki);
+  let h1 = hash3f(gx, gz, ki + 1000);
+  let h2 = hash3f(gx, gz, ki + 2000);
+  let h3 = hash3f(gx, gz, ki + 3000);
+  let hc = hash3f(gx, gz, -1);
+  let bxz = vec2f(ch.x + (f32(ci) + h0) * ${G_CELL}, ch.y + (f32(cj) + h1) * ${G_CELL});
+  let base = vec3f(bxz.x, meshH(bxz), bxz.y);
+  // CPU のチャンク判定は水平距離 (上界)。ここでは高低差込みの 3D 距離で減衰する
+  let d = distance(base, u.camPos.xyz);
+  let bpc = u.geo.z;
+  // 生存順位: セル共通のずらし hc で、同じ k の草が全セル同時に消えないようにする。
+  // 順位は [0, 1 − band/bpc] に縮め、密度 1 の近景ではフェード幅の分も含めて全数が不透明になるようにする
+  let rank = (f32(k) + hc) / bpc * max(1.0 - ${G_BAND}.0 / bpc, 0.5);
+  let rho = textureSampleLevel(rhoTex, samp, rhoUV(bxz), 0.0).r;
+  // 地面色が土に寄る低密度域では 0 本にする
+  let keep = smoothstep(0.28, 0.65, rho);
+  // 距離フェードは大きさでなく光学的厚さ σ を落として透明化する
+  let fade = clamp((densAt(d) * keep - rank) * bpc / ${G_BAND}.0, 0.0, 1.0);
+  let H = u.geo2.x * (0.6 + 0.8*h2);
+  let r = u.geo2.y * 0.5 * (0.7 + 0.6*h3);
+  let a = H * 0.5;
+  let tipH = a * ${1 + G_CF};
+  let N = terrainN(bxz);
+  var axis = normalize(mix(N, vec3f(0.0, 1.0, 0.0), 0.5)) + vec3f(h2 - 0.5, 0.0, h3 - 0.5) * 0.4;
+  if (u.camUp.w > 0.5) {
+    // 偽草の筋の平行移動量 (0.6·wamp) と先端の変位が一致するよう軸を傾ける
+    let time = u.camPos.w;
+    let wamp = 0.10*sin(time*1.9 + bxz.x*0.35 + bxz.y*0.22) + 0.05*sin(time*3.7 + bxz.y*0.53 + bxz.x*0.31);
+    axis += vec3f(0.86, 0.0, 0.5) * (wamp * 0.6 / max(tipH, 0.05));
+  }
+  axis = normalize(axis);
+  let center = base + axis * (a * ${G_CF});
+  // カメラ方向に正対するクアッド。楕円体の正射影の半幅 sqrt(v^T M v) に、
+  // 透視でシルエットが中心面より外に出る分の余裕を掛ける
+  let toC = center - u.camPos.xyz;
+  let dc = length(toC);
+  let Vc = toC / dc;
+  var Rq = cross(Vc, vec3f(0.0, 1.0, 0.0));
+  Rq = select(normalize(Rq), vec3f(1.0, 0.0, 0.0), dot(Rq, Rq) < 1e-6);
+  let Uq = cross(Rq, Vc);
+  let ra = dot(Rq, axis);
+  let ua = dot(Uq, axis);
+  let hw = sqrt(a*a*ra*ra + r*r*(1.0 - ra*ra));
+  let hh = sqrt(a*a*ua*ua + r*r*(1.0 - ua*ua));
+  let ext = max(a, r);
+  let m = min(dc / sqrt(max(dc*dc - ext*ext, 0.01*ext*ext)), 3.0) * 1.05 * step(1e-4, fade);
+  let cx = f32(vi & 1u) * 2.0 - 1.0;
+  let cy = f32(vi >> 1u) * 2.0 - 1.0;
+  let wp = center + Rq * (cx * hw * m) + Uq * (cy * hh * m);
+  var o: GOut;
+  o.pos = u.viewProj * vec4f(wp, 1.0);
+  o.wp = wp;
+  o.center = center;
+  o.axis = axis;
+  o.prm = vec4f(a, r, u.geo.w * fade, 0.0);
+  // 偽草と同じ「1本1色」: 色の式も偽草 (surfaceColor の草オーバーレイ) に揃える。
+  // 偽草は遠方でミップ平均され detB→1 (rd→ρ) に収束するので、株の密度ゲイン 1.0 で
+  // geometry on/off の画面平均色が一致する (実測)。ばらつきは平均より暗い側に寄せる
+  let sun = u.sunDir.xyz;
+  let ndl = max(dot(N, sun), 0.0);
+  let detB = u.geo2.z * (0.8 + 0.6*h2);
+  let shade = 1.35 - 0.52 * min(rho * (0.25 + 0.75*detB), 2.2);
+  var galb = mix(ROOT_COL, TIP_COL, 0.6) * shade;
+  if (u.misc.x < 0.5) { galb *= patchTint(bxz); }
+  o.col = galb * (SUN_COL*ndl*0.9 + SKY_AMB*0.75)
+        + TRANS_COL * pow(max(dot(Vc, sun), 0.0), 6.0) * 0.25;
+  return o;
+}
+struct GFrag { @location(0) color: vec4f, @builtin(frag_depth) depth: f32 }
+@fragment fn fsGrass(in: GOut) -> GFrag {
+  let O = u.camPos.xyz;
+  let D = normalize(in.wp - O);
+  let A = normalize(in.axis);
+  let a = in.prm.x;
+  let r = in.prm.y;
+  // 楕円体を単位球に写す座標 (軸方向 1/a, 直交方向 1/r) でレイと交差
+  let o = O - in.center;
+  let oa = dot(o, A);
+  let da = dot(D, A);
+  let op = (o - A*oa) / r + A * (oa / a);
+  let dp = (D - A*da) / r + A * (da / a);
+  let bq = dot(op, dp);
+  let aq = dot(dp, dp);
+  let cq = dot(op, op) - 1.0;
+  let disc = bq*bq - aq*cq;
+  if (disc <= 0.0) { discard; }
+  let sq = sqrt(disc);
+  let t1 = (-bq + sq) / aq;
+  if (t1 <= 0.0) { discard; }
+  let te = max((-bq - sq) / aq, 0.0);
+  let P = O + D * te;
+  // 密度 (1-s²) の球内線積分は単位球での半弦 hc の 3 乗に比例する。
+  // 1 乗ぶんを世界での半弦 Lw/r に置き換え、軸方向に長い楕円体を見下ろすほど厚くする
+  let hc2 = disc / aq;
+  let Lw = sq / aq;
+  let tau = in.prm.z * hc2 * Lw / r;
+  var alpha = 1.0 - exp(-tau);
+  let clip = u.viewProj * vec4f(P, 1.0);
+  let dist = length(P - O);
+  let c = applyFog(in.col, dist, dot(D, u.sunDir.xyz));
+  if (u.geo2.w > 0.5) {
+    // alpha-to-coverage は MSAA サンプル数に量子化されるので、1 段ぶんの画面ディザで滑らかにする
+    let ign = fract(52.9829189 * fract(0.06711056*in.pos.x + 0.00583715*in.pos.y));
+    alpha = alpha + (ign - 0.5) * 0.25;
+  }
+  var out: GFrag;
+  out.color = vec4f(tonemap(c), clamp(alpha, 0.0, 1.0));
+  out.depth = clamp(clip.z / clip.w, 0.0, 1.0);
+  return out;
 }
 
 // --- 方向ぼかし詳細テクスチャのビューア (赤線が各層のぼかし方向) ---
@@ -413,6 +596,7 @@ async function main() {
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) throw new Error('no GPU adapter');
   const device = await adapter.requestDevice();
+  device.onuncapturederror = e => { console.error('webgpu:', e.error.message); hud.textContent = 'GPU ERROR: ' + e.error.message; };
   device.lost.then(info => {
     console.error('device lost:', info.reason, info.message);
     hud.textContent = 'DEVICE LOST: ' + info.reason + ' ' + info.message;
@@ -552,9 +736,12 @@ async function main() {
       { binding: 2, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, texture: {} },
       { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { viewDimension: '2d-array' } },
       { binding: 4, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+      { binding: 5, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
     ],
   });
-  const uBuf = device.createBuffer({ size: 176, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const uBuf = device.createBuffer({ size: 208, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const chunkBuf = device.createBuffer({ size: G_MAX_CHUNKS * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const chunkData = new Float32Array(G_MAX_CHUNKS * 4);
   const bindA = device.createBindGroup({
     layout: layoutA,
     entries: [
@@ -563,6 +750,7 @@ async function main() {
       { binding: 2, resource: rhoTex.createView() },
       { binding: 3, resource: detailArr.createView({ dimension: '2d-array' }) },
       { binding: 4, resource: sampR },
+      { binding: 5, resource: { buffer: chunkBuf } },
     ],
   });
   const pLayoutA = device.createPipelineLayout({ bindGroupLayouts: [layoutA] });
@@ -584,6 +772,14 @@ async function main() {
     primitive: { topology: 'triangle-list', cullMode: 'none' },
     depthStencil: depthOn,
     multisample: { count: MSAA },
+  });
+  const grassPipe = device.createRenderPipeline({
+    layout: pLayoutA,
+    vertex: { module: sceneMod, entryPoint: 'vsGrass' },
+    fragment: { module: sceneMod, entryPoint: 'fsGrass', targets },
+    primitive: { topology: 'triangle-strip', cullMode: 'none' },
+    depthStencil: depthOn,
+    multisample: { count: MSAA, alphaToCoverageEnabled: true },
   });
   const overlayPipe = device.createRenderPipeline({
     layout: pLayoutA,
@@ -614,6 +810,8 @@ async function main() {
     keys: new Set(),
     barsOn: true, windOn: true, rhoOverlay: false, paused: false, flatGround: false,
     sunAz: 2.4, sunEl: 0.66, kOpacity: 4.0,
+    geomOn: true, bpc: 4, gRadius: 25, gSoft: 0.6, gSigma: 3.0, gDens: 1.25, dither: true,
+    gHeight: parseFloat(q.get('gh') || '0.5'), gWidth: parseFloat(q.get('gw') || '0.1'),
     time: 0, fps: 0,
   };
   state.pos[1] = terrainHJS(0, 240) + 1.7;
@@ -650,11 +848,29 @@ async function main() {
     if (k === '2') state.sunAz += 0.15;
     if (k === '7') state.kOpacity = Math.max(0.2, state.kOpacity / 1.3);
     if (k === '8') state.kOpacity = Math.min(30, state.kOpacity * 1.3);
+    if (k === 'g') state.geomOn = !state.geomOn;
+    if (k === 'x') state.dither = !state.dither;
+    if (k === '3') state.bpc = Math.max(1, state.bpc - 1);
+    if (k === '4') state.bpc = Math.min(G_MAX_BPC, state.bpc + 1);
+    if (k === '5') state.gRadius = Math.max(5, state.gRadius / 1.25);
+    if (k === '6') state.gRadius = Math.min(200, state.gRadius * 1.25);
+    if (k === '9') state.gSigma = Math.max(0.2, state.gSigma / 1.3);
+    if (k === '0') state.gSigma = Math.min(50, state.gSigma * 1.3);
+    if (k === ',') state.gSoft = Math.max(0.05, state.gSoft - 0.05);
+    if (k === '.') state.gSoft = Math.min(0.95, state.gSoft + 0.05);
+    if (k === '[') state.gDens = Math.max(0.2, state.gDens / 1.15);
+    if (k === ']') state.gDens = Math.min(6, state.gDens * 1.15);
+    if (k === 'h') state.gHeight = Math.max(0.05, state.gHeight / 1.15);
+    if (k === 'j') state.gHeight = Math.min(5, state.gHeight * 1.15);
+    if (k === 'k') state.gWidth = Math.max(0.005, state.gWidth / 1.15);
+    if (k === 'l') state.gWidth = Math.min(1, state.gWidth * 1.15);
   });
   window.addEventListener('keyup', e => state.keys.delete(e.key.toLowerCase()));
 
   window.demo = {
     state,
+    // 非表示タブでは rAF が止まるので、計測用に 1 フレームだけ手動で描く
+    renderOnce() { frame(performance.now()); },
     setCam(x, y, z, yaw, pitch) {
       state.pos = [x, y, z]; state.yaw = yaw; state.pitch = pitch;
     },
@@ -683,7 +899,55 @@ async function main() {
   };
 
   // --- frame loop ---
-  const uData = new Float32Array(44);
+  const uData = new Float32Array(52);
+
+  // チャンク AABB の 8 頂点が同じクリップ平面の外側に揃ったら不可視
+  function chunkVisible(vp, ox, oz, y0, y1) {
+    let outMask = 0x3f;
+    for (let i = 0; i < 8; i++) {
+      const x = ox + (i & 1) * G_CHUNK, z = oz + ((i >> 1) & 1) * G_CHUNK, y = (i & 4) ? y1 : y0;
+      const cx = vp[0] * x + vp[4] * y + vp[8] * z + vp[12];
+      const cy = vp[1] * x + vp[5] * y + vp[9] * z + vp[13];
+      const cz = vp[2] * x + vp[6] * y + vp[10] * z + vp[14];
+      const cw = vp[3] * x + vp[7] * y + vp[11] * z + vp[15];
+      let m = 0;
+      if (cx < -cw) m |= 1; if (cx > cw) m |= 2;
+      if (cy < -cw) m |= 4; if (cy > cw) m |= 8;
+      if (cz < 0) m |= 16; if (cz > cw) m |= 32;
+      outMask &= m;
+      if (!outMask) return true;
+    }
+    return false;
+  }
+  function collectChunks(vp, pos) {
+    const R = state.gRadius;
+    const draws = [];
+    let n = 0, blades = 0;
+    const c0x = Math.floor((pos[0] - R) / G_CHUNK), c1x = Math.floor((pos[0] + R) / G_CHUNK);
+    const c0z = Math.floor((pos[2] - R) / G_CHUNK), c1z = Math.floor((pos[2] + R) / G_CHUNK);
+    outer: for (let cz = c0z; cz <= c1z; cz++) for (let cx = c0x; cx <= c1x; cx++) {
+      const ox = cx * G_CHUNK, oz = cz * G_CHUNK;
+      const nx = Math.min(Math.max(pos[0], ox), ox + G_CHUNK);
+      const nz = Math.min(Math.max(pos[2], oz), oz + G_CHUNK);
+      const dens = 1 - sstep(R * (1 - state.gSoft), R, Math.hypot(pos[0] - nx, pos[2] - nz));
+      // rank = (k + hc)/bpc · s < dens を満たす k の個数 (s は VS の順位縮小率)
+      const rankScale = Math.max(1 - G_BAND / state.bpc, 0.5);
+      const kCount = Math.min(state.bpc, Math.ceil(dens * state.bpc / rankScale));
+      if (kCount <= 0) continue;
+      let y0 = Infinity, y1 = -Infinity;
+      for (let j = 0; j < 3; j++) for (let i = 0; i < 3; i++) {
+        const h = terrainHJS(ox + i * G_CHUNK / 2, oz + j * G_CHUNK / 2);
+        y0 = Math.min(y0, h); y1 = Math.max(y1, h);
+      }
+      if (!chunkVisible(vp, ox, oz, y0 - 1, y1 + state.gHeight * 1.5 + 1)) continue;
+      chunkData.set([ox, oz, cx, cz], n * 4);
+      const inst = kCount * G_CELLS * G_CELLS;
+      draws.push([inst, n]);
+      blades += inst;
+      if (++n >= G_MAX_CHUNKS) break outer;
+    }
+    return { draws, n, blades };
+  }
   let prev = performance.now();
   let fpsAcc = 0, fpsN = 0, fpsT = 0;
 
@@ -753,7 +1017,11 @@ async function main() {
     uData.set([sun[0], sun[1], sun[2], state.barsOn ? 1 : 0], 32);
     uData.set([state.kOpacity, SLAB_H, mean, detMean], 36);
     uData.set([state.flatGround ? 1 : 0, 0, 0, 0], 40);
+    uData.set([state.gRadius * (1 - state.gSoft), state.gRadius, state.bpc, state.gSigma], 44);
+    uData.set([state.gHeight, state.gWidth, state.gDens, state.dither ? 1 : 0], 48);
     device.queue.writeBuffer(uBuf, 0, uData);
+    const chunksInfo = state.geomOn ? collectChunks(viewProj, pos) : { draws: [], n: 0, blades: 0 };
+    if (chunksInfo.n > 0) device.queue.writeBuffer(chunkBuf, 0, chunkData, 0, chunksInfo.n * 4);
 
     const enc = device.createCommandEncoder();
     const pass = enc.beginRenderPass({
@@ -771,6 +1039,10 @@ async function main() {
     pass.setPipeline(terrainPipe);
     pass.setIndexBuffer(terIdxBuf, 'uint32');
     pass.drawIndexed(terIdx.length);
+    if (chunksInfo.draws.length) {
+      pass.setPipeline(grassPipe);
+      for (const [inst, slot] of chunksInfo.draws) pass.draw(4, inst, 0, slot * G_MAX_INST);
+    }
     if (state.rhoOverlay) {
       pass.setPipeline(overlayPipe);
       pass.draw(4);
@@ -785,9 +1057,10 @@ async function main() {
       `bars[B] ${state.barsOn ? 'on' : 'off'}  wind[V] ${state.windOn ? 'on' : 'off'}  ` +
       `viewer[T] ${state.rhoOverlay ? 'on' : 'off'}  flat[N] ${state.flatGround ? 'on' : 'off'}\n` +
       `opacity[7/8] ${state.kOpacity.toFixed(1)}  sun[1/2] ${(state.sunAz * 180 / Math.PI).toFixed(0)}°\n` +
+      `geom[G] ${state.geomOn ? 'on' : 'off'}  blades ${(chunksInfo.blades / 1000).toFixed(0)}k / ${chunksInfo.n} chunks  ` +
+      `bpc[3/4] ${state.bpc}  radius[5/6] ${state.gRadius.toFixed(0)}m  soft[,/.] ${state.gSoft.toFixed(2)}  sigma[9/0] ${state.gSigma.toFixed(1)}  dither[X] ${state.dither ? 'on' : 'off'}\n` +
+      `height[H/J] ${(state.gHeight * 100).toFixed(0)}cm  width[K/L] ${(state.gWidth * 100).toFixed(1)}cm  shade-dens[[/]] ${state.gDens.toFixed(2)}\n` +
       `drag:look  WASD:move  R/F:up/down  Shift:fast  P:pause`;
-
-    requestAnimationFrame(frameWrap);
   }
   function frameWrap(now) {
     try {
@@ -796,6 +1069,7 @@ async function main() {
       console.error(e);
       hud.textContent = 'frame error: ' + ((e && e.message) || e);
     }
+    requestAnimationFrame(frameWrap);
   }
   requestAnimationFrame(frameWrap);
 }
