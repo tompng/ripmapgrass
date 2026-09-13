@@ -228,7 +228,7 @@ struct U {
   camUp: vec4f,     // w: windOn
   sunDir: vec4f,    // w: barsOn
   par: vec4f,       // kOpacity, slabH, rhoMean, detailMean
-  misc: vec4f,      // flatGround, -, -, -
+  misc: vec4f,      // flatGround, 偽草の足元線分長 L の下限 (真上から見た葉の見かけの厚み), 筋を溶かす半径, -
   geo: vec4f,       // 密度フェード開始距離, 終了距離, bladesPerCell, sigma (葉の光学的厚さ)
   geo2: vec4f,      // height, width, 株の密度ゲイン (色の明暗), dither
 }
@@ -336,12 +336,19 @@ fn surfaceColor(wp: vec3f, V: vec3f, dist: f32) -> vec3f {
               + latticeDetail(wp.xz, windW, thetaView, ${Math.PI / (2 * NDIR)})) * 0.5;
     let detN = dsum / max(u.par.w, 1e-3);
     // 正規化で潰れた振幅を偏差ゲインで戻す (0 クランプは max で滑らかに回避)
-    let detB = max(1.0 + (detN - 1.0) * 2.4, 0.05);
+    var detB = max(1.0 + (detN - 1.0) * 2.4, 0.05);
+    let sinG = clamp(abs(dot(V, N)), 0.02, 1.0);
+    // 筋はカメラ足元を中心に放射状に並ぶので、足元からの水平距離が筋の長さ (~0.8m) と
+    // 同程度の範囲では 1 本の筋の中で方位が曲がり、放射模様として見える。そこだけ方向性を
+    // 平均 (detB=1) に溶かす。角度で判定すると高高度で真下の広い範囲のディテールが消える
+    let rHoriz = distance(wp.xz, u.camPos.xz);
+    detB = mix(detB, 1.0, 1.0 - smoothstep(u.misc.z * 0.3, u.misc.z, rHoriz));
     // マクロは無方向の連続密度、方向性は詳細レイヤーが担う
     var rd = rho * (0.25 + 0.75 * detB);
     // 不透明度: 密度 × グレージングでの見かけ光路長 (足元線分長は固定上限でクランプ)
-    let sinG = clamp(abs(dot(V, N)), 0.02, 1.0);
-    let L = clamp(u.par.y * sqrt(1.0 - sinG*sinG) / sinG, 0.1, 12.0);
+    // 下限は真上から見た葉の見かけの厚み。0 に近いと見下ろしで地面色だけになり、
+    // 上に重ねるジオメトリ草 (glit 色) が浮く
+    let L = clamp(u.par.y * sqrt(1.0 - sinG*sinG) / sinG, u.misc.y, 12.0);
     let tau = u.par.x * rd * L;
     let alpha = 1.0 - exp(-tau);
     // 高密度側でも飽和しない線形カーブにして、密草地帯の中の濃淡を残す
@@ -402,8 +409,9 @@ fn densAt(d: f32) -> f32 { return 1.0 - smoothstep(u.geo.x, u.geo.y, d); }
   // 順位は [0, 1 − band/bpc] に縮め、密度 1 の近景ではフェード幅の分も含めて全数が不透明になるようにする
   let rank = (f32(k) + hc) / bpc * max(1.0 - ${G_BAND}.0 / bpc, 0.5);
   let rho = textureSampleLevel(rhoTex, samp, rhoUV(bxz), 0.0).r;
-  // 地面色が土に寄る低密度域では 0 本にする
-  let keep = smoothstep(0.28, 0.65, rho);
+  // 地面色が土に寄る低密度域では 0 本にする。上限側は偽草の不透明度 (ρ に比例) と
+  // 減り方を揃えるため低めに取る (高いと中密度帯でジオメトリだけ先に疎になる)
+  let keep = smoothstep(0.1, 0.45, rho);
   // 距離フェードは大きさでなく光学的厚さ σ を落として透明化する
   let fade = clamp((densAt(d) * keep - rank) * bpc / ${G_BAND}.0, 0.0, 1.0);
   let H = u.geo2.x * (0.6 + 0.8*h2);
@@ -807,8 +815,10 @@ async function main() {
     keys: new Set(),
     barsOn: true, windOn: true, rhoOverlay: false, paused: false, flatGround: false,
     sunAz: 2.4, sunEl: 0.66, kOpacity: 4.0,
-    geomOn: true, bpc: 4, gRadius: 25, gSoft: 0.6, gSigma: 3.0, gDens: 1.25, dither: true,
+    geomOn: true, bpc: 4, gRadius: 25, gSoft: 0.6, gSigma: 3.0, gDens: 1.0, dither: true,
     gHeight: parseFloat(q.get('gh') || '0.5'), gWidth: parseFloat(q.get('gw') || '0.1'),
+    lMin: parseFloat(q.get('lmin') || '1.0'),
+    meltR: parseFloat(q.get('melt') || '1.0'),
     time: 0, fps: 0,
   };
   state.pos[1] = terrainHJS(0, 240) + 1.7;
@@ -857,6 +867,8 @@ async function main() {
     if (k === '.') state.gSoft = Math.min(0.95, state.gSoft + 0.05);
     if (k === '[') state.gDens = Math.max(0.2, state.gDens / 1.15);
     if (k === ']') state.gDens = Math.min(6, state.gDens * 1.15);
+    if (k === '-') state.lMin = Math.max(0.02, state.lMin / 1.25);
+    if (k === '=') state.lMin = Math.min(5, state.lMin * 1.25);
     if (k === 'h') state.gHeight = Math.max(0.05, state.gHeight / 1.15);
     if (k === 'j') state.gHeight = Math.min(5, state.gHeight * 1.15);
     if (k === 'k') state.gWidth = Math.max(0.005, state.gWidth / 1.15);
@@ -1014,7 +1026,7 @@ async function main() {
     uData.set([up[0], up[1], up[2], state.windOn ? 1 : 0], 28);
     uData.set([sun[0], sun[1], sun[2], state.barsOn ? 1 : 0], 32);
     uData.set([state.kOpacity, SLAB_H, mean, detMean], 36);
-    uData.set([state.flatGround ? 1 : 0, 0, 0, 0], 40);
+    uData.set([state.flatGround ? 1 : 0, state.lMin, state.meltR, 0], 40);
     uData.set([state.gRadius * (1 - state.gSoft), state.gRadius, state.bpc, state.gSigma], 44);
     uData.set([state.gHeight, state.gWidth, state.gDens, state.dither ? 1 : 0], 48);
     device.queue.writeBuffer(uBuf, 0, uData);
@@ -1054,7 +1066,7 @@ async function main() {
       `ndir ${NDIR}  dtex ${DETAIL_TEX}px / dspan ${DETAIL_SPAN}m (${(DETAIL_SPAN / DETAIL_TEX * 100).toFixed(1)}cm/texel)  mem ${detMB.toFixed(1)}MB\n` +
       `bars[B] ${state.barsOn ? 'on' : 'off'}  wind[V] ${state.windOn ? 'on' : 'off'}  ` +
       `viewer[T] ${state.rhoOverlay ? 'on' : 'off'}  flat[N] ${state.flatGround ? 'on' : 'off'}\n` +
-      `opacity[7/8] ${state.kOpacity.toFixed(1)}  sun[1/2] ${(state.sunAz * 180 / Math.PI).toFixed(0)}°\n` +
+      `opacity[7/8] ${state.kOpacity.toFixed(1)}  lmin[-/=] ${state.lMin.toFixed(2)}m  melt ${state.meltR.toFixed(1)}m  sun[1/2] ${(state.sunAz * 180 / Math.PI).toFixed(0)}°\n` +
       `geom[G] ${state.geomOn ? 'on' : 'off'}  blades ${(chunksInfo.blades / 1000).toFixed(0)}k / ${chunksInfo.n} chunks  ` +
       `bpc[3/4] ${state.bpc}  radius[5/6] ${state.gRadius.toFixed(0)}m  soft[,/.] ${state.gSoft.toFixed(2)}  sigma[9/0] ${state.gSigma.toFixed(1)}  dither[X] ${state.dither ? 'on' : 'off'}\n` +
       `height[H/J] ${(state.gHeight * 100).toFixed(0)}cm  width[K/L] ${(state.gWidth * 100).toFixed(1)}cm  shade-dens[[/]] ${state.gDens.toFixed(2)}\n` +
