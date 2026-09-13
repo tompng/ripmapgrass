@@ -456,8 +456,9 @@ fn densAt(d: f32) -> f32 { return 1.0 - smoothstep(u.geo.x, u.geo.y, d); }
         + TRANS_COL * pow(max(dot(Vc, sun), 0.0), 6.0) * 0.25;
   return o;
 }
-struct GFrag { @location(0) color: vec4f, @builtin(frag_depth) depth: f32 }
-@fragment fn fsGrass(in: GOut) -> GFrag {
+// 深度はクアッド平面のまま (楕円体表面の深度を frag_depth で書くと early-z が効かず
+// 131k 本で約 15% 遅い。同色の柔らかい草どうしでは見た目の差が出ない)
+@fragment fn fsGrass(in: GOut) -> @location(0) vec4f {
   let O = u.camPos.xyz;
   let D = normalize(in.wp - O);
   let A = normalize(in.axis);
@@ -485,7 +486,6 @@ struct GFrag { @location(0) color: vec4f, @builtin(frag_depth) depth: f32 }
   let Lw = sq / aq;
   let tau = in.prm.z * hc2 * Lw / r;
   var alpha = 1.0 - exp(-tau);
-  let clip = u.viewProj * vec4f(P, 1.0);
   let dist = length(P - O);
   let c = applyFog(in.col, dist, dot(D, u.sunDir.xyz));
   if (u.geo2.w > 0.5) {
@@ -493,10 +493,7 @@ struct GFrag { @location(0) color: vec4f, @builtin(frag_depth) depth: f32 }
     let ign = fract(52.9829189 * fract(0.06711056*in.pos.x + 0.00583715*in.pos.y));
     alpha = alpha + (ign - 0.5) * 0.25;
   }
-  var out: GFrag;
-  out.color = vec4f(tonemap(c), clamp(alpha, 0.0, 1.0));
-  out.depth = clamp(clip.z / clip.w, 0.0, 1.0);
-  return out;
+  return vec4f(tonemap(c), clamp(alpha, 0.0, 1.0));
 }
 
 // --- 方向ぼかし詳細テクスチャのビューア (赤線が各層のぼかし方向) ---
@@ -871,6 +868,7 @@ async function main() {
     state,
     // 非表示タブでは rAF が止まるので、計測用に 1 フレームだけ手動で描く
     renderOnce() { frame(performance.now()); },
+    device,
     setCam(x, y, z, yaw, pitch) {
       state.pos = [x, y, z]; state.yaw = yaw; state.pitch = pitch;
     },
