@@ -11,6 +11,11 @@ const q = new URLSearchParams(location.search);
 const NDIR = parseInt(q.get('ndir') || '12', 10);   // 180° を等分。ぼかしは対称なので逆向きの区別は不要
 const DETAIL_TEX = parseInt(q.get('dtex') || '256', 10);
 const DETAIL_SPAN = parseFloat(q.get('dspan') || '5');
+// 等方層 (layer NDIR、カメラ足元用) の σ [texel] と振幅係数。σ を上げて方向ぼかしと分散を
+// 揃えると粒が 20cm 級に太るので、σ は葉幅程度に留めて平均まわりの振幅を縮める
+// (標準偏差は方向層 0.119 に対し 0.117 で一致)
+const ISO_SIGMA = 1.5;
+const ISO_GAIN = 0.7;
 const TEX = 4096;
 const REG_MIN = -512, REG_SPAN = 1024;
 // 方向性ぼかしは詳細タイルだけが持つ。マクロ密度 (0.25m/texel) を
@@ -228,7 +233,7 @@ struct U {
   camUp: vec4f,     // w: windOn
   sunDir: vec4f,    // w: barsOn
   par: vec4f,       // kOpacity, slabH, rhoMean, detailMean
-  misc: vec4f,      // flatGround, 偽草の足元線分長 L の下限 (真上から見た葉の見かけの厚み), 筋を溶かす半径, -
+  misc: vec4f,      // flatGround, 偽草の足元線分長 L の下限 (真上から見た葉の見かけの厚み), -, -
   geo: vec4f,       // 密度フェード開始距離, 終了距離, bladesPerCell, sigma (葉の光学的厚さ)
   geo2: vec4f,      // height, width, 株の密度ゲイン (色の明暗), dither
 }
@@ -282,7 +287,9 @@ struct TOut { @builtin(position) pos: vec4f, @location(0) wp: vec3f }
 }
 // 1格子ぶんの方向性詳細密度。格子を β 回転して貼る場合、テクスチャ空間で
 // 参照すべきぼかし方位は θ_view − β (筋は貼り付けの回転を経て世界では視線方位に揃う)
-fn latticeDetail(p: vec2f, windW: vec2f, thetaView: f32, beta: f32) -> f32 {
+// iso > 0 の画素では層 NDIR (方向ぼかしなしの等方タイル) を追加で引いて混ぜる。
+// 非一様な分岐の中でサンプルするため、勾配は分岐の外で取って textureSampleGrad に渡す
+fn latticeDetail(p: vec2f, windW: vec2f, thetaView: f32, beta: f32, iso: f32) -> f32 {
   var tm = thetaView - beta;
   tm = tm - floor(tm / PI) * PI;
   var i0 = floor(tm / (PI / ${NDIR}.0));
@@ -296,7 +303,13 @@ fn latticeDetail(p: vec2f, windW: vec2f, thetaView: f32, beta: f32) -> f32 {
   let duv = (lp - lw) / ${DETAIL_SPAN};
   // レイヤー i の rg には方位 (i, i+1) がペアで焼いてあるので、補間に要る隣接2方位が 1 fetch で揃う
   let d = textureSample(detailArr, sampR, duv, i32(i0)).rg;
-  return mix(d.x, d.y, fw);
+  var v = mix(d.x, d.y, fw);
+  let ddx = dpdx(duv);
+  let ddy = dpdy(duv);
+  if (iso > 0.0) {
+    v = mix(v, textureSampleGrad(detailArr, sampR, duv, ${NDIR}, ddx, ddy).r, iso);
+  }
+  return v;
 }
 
 // 地面+遠景草オーバーレイ込みの表面色 (フォグ・トーンマップ前)
@@ -332,17 +345,18 @@ fn surfaceColor(wp: vec3f, V: vec3f, dist: f32) -> vec3f {
     // 非周期になり、方向量子化の誤差も格子間で非相関化される。
     // 2枚の和 (÷2) を表現したい場そのものとみなし、分散の √2 復元はしない
     // (復元すると最大値が範囲を超え、濃部にベタ塗りが出る)
-    let dsum = (latticeDetail(wp.xz, windW, thetaView, 0.0)
-              + latticeDetail(wp.xz, windW, thetaView, ${Math.PI / (2 * NDIR)})) * 0.5;
+    // 筋はカメラ足元を中心に放射状に並ぶので、足元の近くでは 1 本の筋の中で方位が曲がり、
+    // 放射模様として見える。そこは方向ぼかしなしの等方タイルへ混ぜる (タイル平均へ寄せると
+    // 模様の無い円盤がカメラに追従して見える)。範囲は「水平 2m」と「鉛直から tan 0.1 の円錐」の
+    // soft な min: 地上では筋長 (~0.8m) の数倍、高高度では狭い円錐なので追加フェッチは少ない
+    let rHoriz = distance(wp.xz, u.camPos.xz);
+    let isoW = 1.0 - smoothstep(0.0, 0.1, rHoriz / (20.0 + abs(wp.y - u.camPos.y)));
+    let dsum = (latticeDetail(wp.xz, windW, thetaView, 0.0, isoW)
+              + latticeDetail(wp.xz, windW, thetaView, ${Math.PI / (2 * NDIR)}, isoW)) * 0.5;
     let detN = dsum / max(u.par.w, 1e-3);
     // 正規化で潰れた振幅を偏差ゲインで戻す (0 クランプは max で滑らかに回避)
-    var detB = max(1.0 + (detN - 1.0) * 2.4, 0.05);
+    let detB = max(1.0 + (detN - 1.0) * 2.4, 0.05);
     let sinG = clamp(abs(dot(V, N)), 0.02, 1.0);
-    // 筋はカメラ足元を中心に放射状に並ぶので、足元からの水平距離が筋の長さ (~0.8m) と
-    // 同程度の範囲では 1 本の筋の中で方位が曲がり、放射模様として見える。そこだけ方向性を
-    // 平均 (detB=1) に溶かす。角度で判定すると高高度で真下の広い範囲のディテールが消える
-    let rHoriz = distance(wp.xz, u.camPos.xz);
-    detB = mix(detB, 1.0, 1.0 - smoothstep(u.misc.z * 0.3, u.misc.z, rHoriz));
     // マクロは無方向の連続密度、方向性は詳細レイヤーが担う
     var rd = rho * (0.25 + 0.75 * detB);
     // 不透明度: 密度 × グレージングでの見かけ光路長 (足元線分長は固定上限でクランプ)
@@ -561,6 +575,24 @@ struct BU { dir: vec4f }
   }
   return vec4f(acc / wsum, 0.0, 1.0);
 }
+// 等方ガウスぼかし (σ = dir.x texel、平均 dir.z まわりの振幅 × dir.y)。
+// rg に同じ値を入れ、方位補間の mix がそのまま通るようにする
+@fragment fn fsBlurIso(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+  let dim = vec2f(textureDimensions(src));
+  let uv = fc.xy / dim;
+  let s2i = 1.0 / (2.0 * bu.dir.x * bu.dir.x);
+  var acc = 0.0;
+  var wsum = 0.0;
+  for (var j = -4; j <= 4; j++) {
+    for (var i = -4; i <= 4; i++) {
+      let w = exp(-f32(i*i + j*j) * s2i);
+      acc += textureSampleLevel(src, s2, uv + vec2f(f32(i), f32(j)) / dim, 0.0).r * w;
+      wsum += w;
+    }
+  }
+  let v = bu.dir.z + (acc / wsum - bu.dir.z) * bu.dir.y;
+  return vec4f(v, v, 0.0, 1.0);
+}
 @fragment fn fsMip(@builtin(position) fc: vec4f) -> @location(0) vec4f {
   let dim = textureDimensions(src);
   let base = vec2u(fc.xy) * 2u;
@@ -644,7 +676,7 @@ async function main() {
   // レイヤー i の rg = 方位 (i, i+1) のペア。g は次レイヤーの r と同値の重複だが、
   // サンプリング側の方位補間が 1 fetch になる
   const detailArr = device.createTexture({
-    size: [DETAIL_TEX, DETAIL_TEX, NDIR], format: 'rg16float', mipLevelCount: detMipCount,
+    size: [DETAIL_TEX, DETAIL_TEX, NDIR + 1], format: 'rg16float', mipLevelCount: detMipCount,
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
   });
   {
@@ -665,6 +697,7 @@ async function main() {
       primitive: { topology: 'triangle-list' },
     });
     const blurPipe = mkPipe('fsBlur', 'rg16float');
+    const blurIsoPipe = mkPipe('fsBlurIso', 'rg16float');
     const mipPipeR = mkPipe('fsMip', 'r16float');
     const mipPipeRG = mkPipe('fsMip', 'rg16float');
     const enc = device.createCommandEncoder();
@@ -700,6 +733,29 @@ async function main() {
     };
     // タップ間隔 0.05m ±8 → 葉幅 4cm に対して縦横比 ~10:1 の筋
     blurDirs(detailTex, detailArr, 0.05, DETAIL_SPAN, sampR);
+    // 層 NDIR: カメラ足元用の等方タイル
+    {
+      const bu = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      device.queue.writeBuffer(bu, 0, new Float32Array([ISO_SIGMA, ISO_GAIN, detMean, 0]));
+      const bind = device.createBindGroup({
+        layout: blurIsoPipe.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: bu } },
+          { binding: 1, resource: detailTex.createView({ baseMipLevel: 0, mipLevelCount: 1 }) },
+          { binding: 2, resource: sampR },
+        ],
+      });
+      const pass = enc.beginRenderPass({
+        colorAttachments: [{
+          view: detailArr.createView({ dimension: '2d', baseMipLevel: 0, mipLevelCount: 1, baseArrayLayer: NDIR, arrayLayerCount: 1 }),
+          loadOp: 'clear', clearValue: [0, 0, 0, 0], storeOp: 'store',
+        }],
+      });
+      pass.setPipeline(blurIsoPipe);
+      pass.setBindGroup(0, bind);
+      pass.draw(3);
+      pass.end();
+    }
     const genMips = (tex, layers, levels, mipPipe) => {
       for (let layer = 0; layer < layers; layer++) {
         for (let lv = 1; lv < levels; lv++) {
@@ -724,7 +780,7 @@ async function main() {
       }
     };
     genMips(rhoTex, 1, mipCount, mipPipeR);
-    genMips(detailArr, NDIR, detMipCount, mipPipeRG);
+    genMips(detailArr, NDIR + 1, detMipCount, mipPipeRG);
     device.queue.submit([enc.finish()]);
     await device.queue.onSubmittedWorkDone();
   }
@@ -818,7 +874,6 @@ async function main() {
     geomOn: true, bpc: 4, gRadius: 25, gSoft: 0.6, gSigma: 3.0, gDens: 1.0, dither: true,
     gHeight: parseFloat(q.get('gh') || '0.5'), gWidth: parseFloat(q.get('gw') || '0.1'),
     lMin: parseFloat(q.get('lmin') || '1.0'),
-    meltR: parseFloat(q.get('melt') || '1.0'),
     time: 0, fps: 0,
   };
   state.pos[1] = terrainHJS(0, 240) + 1.7;
@@ -1026,7 +1081,7 @@ async function main() {
     uData.set([up[0], up[1], up[2], state.windOn ? 1 : 0], 28);
     uData.set([sun[0], sun[1], sun[2], state.barsOn ? 1 : 0], 32);
     uData.set([state.kOpacity, SLAB_H, mean, detMean], 36);
-    uData.set([state.flatGround ? 1 : 0, state.lMin, state.meltR, 0], 40);
+    uData.set([state.flatGround ? 1 : 0, state.lMin, 0, 0], 40);
     uData.set([state.gRadius * (1 - state.gSoft), state.gRadius, state.bpc, state.gSigma], 44);
     uData.set([state.gHeight, state.gWidth, state.gDens, state.dither ? 1 : 0], 48);
     device.queue.writeBuffer(uBuf, 0, uData);
@@ -1060,13 +1115,13 @@ async function main() {
     pass.end();
     device.queue.submit([enc.finish()]);
 
-    const detMB = DETAIL_TEX * DETAIL_TEX * NDIR * 4 * 4 / 3 / 1048576;
+    const detMB = DETAIL_TEX * DETAIL_TEX * (NDIR + 1) * 4 * 4 / 3 / 1048576;
     hud.textContent =
       `fps ${state.fps.toFixed(0)}  density ${densMs.toFixed(0)}ms  blur ${blurMs.toFixed(0)}ms\n` +
       `ndir ${NDIR}  dtex ${DETAIL_TEX}px / dspan ${DETAIL_SPAN}m (${(DETAIL_SPAN / DETAIL_TEX * 100).toFixed(1)}cm/texel)  mem ${detMB.toFixed(1)}MB\n` +
       `bars[B] ${state.barsOn ? 'on' : 'off'}  wind[V] ${state.windOn ? 'on' : 'off'}  ` +
       `viewer[T] ${state.rhoOverlay ? 'on' : 'off'}  flat[N] ${state.flatGround ? 'on' : 'off'}\n` +
-      `opacity[7/8] ${state.kOpacity.toFixed(1)}  lmin[-/=] ${state.lMin.toFixed(2)}m  melt ${state.meltR.toFixed(1)}m  sun[1/2] ${(state.sunAz * 180 / Math.PI).toFixed(0)}°\n` +
+      `opacity[7/8] ${state.kOpacity.toFixed(1)}  lmin[-/=] ${state.lMin.toFixed(2)}m  sun[1/2] ${(state.sunAz * 180 / Math.PI).toFixed(0)}°\n` +
       `geom[G] ${state.geomOn ? 'on' : 'off'}  blades ${(chunksInfo.blades / 1000).toFixed(0)}k / ${chunksInfo.n} chunks  ` +
       `bpc[3/4] ${state.bpc}  radius[5/6] ${state.gRadius.toFixed(0)}m  soft[,/.] ${state.gSoft.toFixed(2)}  sigma[9/0] ${state.gSigma.toFixed(1)}  dither[X] ${state.dither ? 'on' : 'off'}\n` +
       `height[H/J] ${(state.gHeight * 100).toFixed(0)}cm  width[K/L] ${(state.gWidth * 100).toFixed(1)}cm  shade-dens[[/]] ${state.gDens.toFixed(2)}\n` +
