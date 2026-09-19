@@ -16,6 +16,9 @@ const DETAIL_SPAN = parseFloat(q.get('dspan') || '5');
 // (標準偏差は方向層 0.119 に対し 0.117 で一致)
 const ISO_SIGMA = 1.5;
 const ISO_GAIN = 0.7;
+// 短いぼかし: 長いぼかしに対する長さの比と、平均まわりの振幅係数 (長いぼかしと分散を揃える)
+const SHORT_RATIO = parseFloat(q.get('short') || '0.25');
+const SHORT_GAIN = parseFloat(q.get('shortGain') || '0.7');
 const TEX = 4096;
 const REG_MIN = -512, REG_SPAN = 1024;
 // 方向性ぼかしは詳細タイルだけが持つ。マクロ密度 (0.25m/texel) を
@@ -233,7 +236,7 @@ struct U {
   camUp: vec4f,     // w: windOn
   sunDir: vec4f,    // w: barsOn
   par: vec4f,       // kOpacity, slabH, rhoMean, detailMean
-  misc: vec4f,      // flatGround, 偽草の足元線分長 L の下限 (真上から見た葉の見かけの厚み), -, -
+  misc: vec4f,      // flatGround, 偽草の足元線分長 L の下限 (真上から見た葉の見かけの厚み), 詳細モード (0: 長+等方, 1: 長/短+等方, 2: 長/短), -
   geo: vec4f,       // 密度フェード開始距離, 終了距離, bladesPerCell, sigma (葉の光学的厚さ)
   geo2: vec4f,      // height, width, 株の密度ゲイン (色の明暗), dither
 }
@@ -287,9 +290,11 @@ struct TOut { @builtin(position) pos: vec4f, @location(0) wp: vec3f }
 }
 // 1格子ぶんの方向性詳細密度。格子を β 回転して貼る場合、テクスチャ空間で
 // 参照すべきぼかし方位は θ_view − β (筋は貼り付けの回転を経て世界では視線方位に揃う)
+// 各レイヤーの rg は長いぼかし、ba は同じ方位の短いぼかし (SHORT_RATIO 倍) で、short で混ぜる。
+// 像が短い所 (視線が軸に沿う点の近く) では短いぼかしにすると放射模様の出る半径が縮む。
 // iso > 0 の画素では層 NDIR (方向ぼかしなしの等方タイル) を追加で引いて混ぜる。
 // 非一様な分岐の中でサンプルするため、勾配は分岐の外で取って textureSampleGrad に渡す
-fn latticeDetail(p: vec2f, windW: vec2f, thetaView: f32, beta: f32, iso: f32) -> f32 {
+fn latticeDetail(p: vec2f, windW: vec2f, thetaView: f32, beta: f32, iso: f32, short: f32) -> f32 {
   var tm = thetaView - beta;
   tm = tm - floor(tm / PI) * PI;
   var i0 = floor(tm / (PI / ${NDIR}.0));
@@ -302,8 +307,8 @@ fn latticeDetail(p: vec2f, windW: vec2f, thetaView: f32, beta: f32, iso: f32) ->
   // 参照点を p − w にすると模様は +w 方向へ動く (ジオメトリ草の先端と同じ向き)
   let duv = (lp - lw) / ${DETAIL_SPAN};
   // レイヤー i の rg には方位 (i, i+1) がペアで焼いてあるので、補間に要る隣接2方位が 1 fetch で揃う
-  let d = textureSample(detailArr, sampR, duv, i32(i0)).rg;
-  var v = mix(d.x, d.y, fw);
+  let d = textureSample(detailArr, sampR, duv, i32(i0));
+  var v = mix(mix(d.x, d.y, fw), mix(d.z, d.w, fw), short);
   let ddx = dpdx(duv);
   let ddy = dpdy(duv);
   if (iso > 0.0) {
@@ -357,9 +362,18 @@ fn surfaceColor(wp: vec3f, V: vec3f, dist: f32) -> vec3f {
     // なので、「水平 2m」と「鉛直から tan 0.1 の円錐」の soft な min になる: 地上では筋長
     // (~0.8m) の数倍、高高度では狭い円錐なので追加フェッチは少ない
     let dy = abs(wp.y - u.camPos.y);
-    let isoW = 1.0 - smoothstep(0.0, 0.1, lh * dy / (20.0 + dy));
-    let dsum = (latticeDetail(wp.xz, windW, thetaView, 0.0, isoW)
-              + latticeDetail(wp.xz, windW, thetaView, ${Math.PI / (2 * NDIR)}, isoW)) * 0.5;
+    let tv = lh * dy / (20.0 + dy);
+    var isoW = 1.0 - smoothstep(0.0, 0.1, tv);
+    var shortW = 0.0;
+    if (u.misc.z > 0.5) {
+      // 長いぼかしの長さを草の公称高さとみなすと、地面上の像の長さはその lh 倍。像が短いぼかしの
+      // 長さ比まで縮む所で短いぼかしに切り替え、間は混ぜる。等方はぼかし長の比だけ縮んだ
+      // 範囲にだけ残す (モード 2 では無し)
+      shortW = 1.0 - smoothstep(${SHORT_RATIO}, 1.0, lh);
+      isoW = select(0.0, 1.0 - smoothstep(0.0, 0.1 * ${SHORT_RATIO}, tv), u.misc.z < 1.5);
+    }
+    let dsum = (latticeDetail(wp.xz, windW, thetaView, 0.0, isoW, shortW)
+              + latticeDetail(wp.xz, windW, thetaView, ${Math.PI / (2 * NDIR)}, isoW, shortW)) * 0.5;
     let detN = dsum / max(u.par.w, 1e-3);
     // 正規化で潰れた振幅を偏差ゲインで戻す (0 クランプは max で滑らかに回避)
     let detB = max(1.0 + (detN - 1.0) * 2.4, 0.05);
@@ -560,7 +574,7 @@ struct OOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f }
 `;
 
 const BLUR_WGSL = /* wgsl */`
-struct BU { dir: vec4f }
+struct BU { dir: vec4f, prm: vec4f }  // prm: 短いぼかしの長さ比, その振幅係数, 平均, -
 @group(0) @binding(0) var<uniform> bu: BU;
 @group(0) @binding(1) var src: texture_2d<f32>;
 @group(0) @binding(2) var s2: sampler;
@@ -571,16 +585,21 @@ struct BU { dir: vec4f }
 }
 @fragment fn fsBlur(@builtin(position) fc: vec4f) -> @location(0) vec4f {
   let uv = fc.xy / vec2f(textureDimensions(src));
-  var acc = vec2f(0.0);
+  var acc = vec4f(0.0);
   var wsum = 0.0;
   for (var t = -8; t <= 8; t++) {
     let w = exp(-f32(t*t) * 0.05);
-    acc += vec2f(
-      textureSampleLevel(src, s2, uv + bu.dir.xy * f32(t), 0.0).r,
-      textureSampleLevel(src, s2, uv + bu.dir.zw * f32(t), 0.0).r) * w;
+    let ft = f32(t);
+    acc += vec4f(
+      textureSampleLevel(src, s2, uv + bu.dir.xy * ft, 0.0).r,
+      textureSampleLevel(src, s2, uv + bu.dir.zw * ft, 0.0).r,
+      textureSampleLevel(src, s2, uv + bu.dir.xy * (ft * bu.prm.x), 0.0).r,
+      textureSampleLevel(src, s2, uv + bu.dir.zw * (ft * bu.prm.x), 0.0).r) * w;
     wsum += w;
   }
-  return vec4f(acc / wsum, 0.0, 1.0);
+  let v = acc / wsum;
+  let m = bu.prm.z;
+  return vec4f(v.xy, m + (v.zw - vec2f(m)) * bu.prm.y);
 }
 // 等方ガウスぼかし (σ = dir.x texel、平均 dir.z まわりの振幅 × dir.y)。
 // rg に同じ値を入れ、方位補間の mix がそのまま通るようにする
@@ -598,7 +617,7 @@ struct BU { dir: vec4f }
     }
   }
   let v = bu.dir.z + (acc / wsum - bu.dir.z) * bu.dir.y;
-  return vec4f(v, v, 0.0, 1.0);
+  return vec4f(v);
 }
 @fragment fn fsMip(@builtin(position) fc: vec4f) -> @location(0) vec4f {
   let dim = textureDimensions(src);
@@ -680,10 +699,11 @@ async function main() {
     size: [DETAIL_TEX, DETAIL_TEX], format: 'r16float',
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
   });
-  // レイヤー i の rg = 方位 (i, i+1) のペア。g は次レイヤーの r と同値の重複だが、
-  // サンプリング側の方位補間が 1 fetch になる
+  // レイヤー i の rg = 方位 (i, i+1) の長いぼかし、ba = 同じ方位の短いぼかし。g は次レイヤーの
+  // r と同値の重複だが、サンプリング側の方位補間が 1 fetch になる。密度は 8bit で足りるので
+  // rgba8unorm にすればテクセルは rg16float と同じ 4 バイト
   const detailArr = device.createTexture({
-    size: [DETAIL_TEX, DETAIL_TEX, NDIR + 1], format: 'rg16float', mipLevelCount: detMipCount,
+    size: [DETAIL_TEX, DETAIL_TEX, NDIR + 1], format: 'rgba8unorm', mipLevelCount: detMipCount,
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
   });
   {
@@ -703,20 +723,21 @@ async function main() {
       fragment: { module: blurMod, entryPoint, targets: [{ format }] },
       primitive: { topology: 'triangle-list' },
     });
-    const blurPipe = mkPipe('fsBlur', 'rg16float');
-    const blurIsoPipe = mkPipe('fsBlurIso', 'rg16float');
+    const blurPipe = mkPipe('fsBlur', 'rgba8unorm');
+    const blurIsoPipe = mkPipe('fsBlurIso', 'rgba8unorm');
     const mipPipeR = mkPipe('fsMip', 'r16float');
-    const mipPipeRG = mkPipe('fsMip', 'rg16float');
+    const mipPipeRG = mkPipe('fsMip', 'rgba8unorm');
     const enc = device.createCommandEncoder();
     // dir.xy に方位 i、dir.zw に方位 i+1 (i+1 = NDIR は θ=π で、ぼかしの対称性により方位 0 と同じ)
     const blurDirs = (srcTex, dstTex, stepM, span, blurSamp) => {
       for (let dir = 0; dir < NDIR; dir++) {
         const th0 = dir * Math.PI / NDIR;
         const th1 = (dir + 1) * Math.PI / NDIR;
-        const bu = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        const bu = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
         device.queue.writeBuffer(bu, 0, new Float32Array([
           Math.cos(th0) * stepM / span, Math.sin(th0) * stepM / span,
           Math.cos(th1) * stepM / span, Math.sin(th1) * stepM / span,
+          SHORT_RATIO, SHORT_GAIN, detMean, 0,
         ]));
         const bind = device.createBindGroup({
           layout: blurPipe.getBindGroupLayout(0),
@@ -742,8 +763,8 @@ async function main() {
     blurDirs(detailTex, detailArr, 0.05, DETAIL_SPAN, sampR);
     // 層 NDIR: カメラ足元用の等方タイル
     {
-      const bu = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-      device.queue.writeBuffer(bu, 0, new Float32Array([ISO_SIGMA, ISO_GAIN, detMean, 0]));
+      const bu = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      device.queue.writeBuffer(bu, 0, new Float32Array([ISO_SIGMA, ISO_GAIN, detMean, 0, 0, 0, 0, 0]));
       const bind = device.createBindGroup({
         layout: blurIsoPipe.getBindGroupLayout(0),
         entries: [
@@ -877,6 +898,7 @@ async function main() {
     pos: [0, 0, 240], yaw: 0.55, pitch: -0.06,
     keys: new Set(),
     barsOn: true, windOn: true, rhoOverlay: false, paused: false, flatGround: false,
+    detailMode: parseInt(q.get('dmode') || '1', 10),
     sunAz: 2.4, sunEl: 0.66, kOpacity: 4.0,
     geomOn: true, bpc: 4, gRadius: 25, gSoft: 0.6, gSigma: 3.0, gDens: 1.0, dither: true,
     gHeight: parseFloat(q.get('gh') || '0.5'), gWidth: parseFloat(q.get('gw') || '0.1'),
@@ -911,6 +933,7 @@ async function main() {
     if (k === 'b') state.barsOn = !state.barsOn;
     if (k === 't') state.rhoOverlay = !state.rhoOverlay;
     if (k === 'v') state.windOn = !state.windOn;
+    if (k === 'i') state.detailMode = (state.detailMode + 1) % 3;
     if (k === 'p') state.paused = !state.paused;
     if (k === 'n') state.flatGround = !state.flatGround;
     if (k === '1') state.sunAz -= 0.15;
@@ -947,9 +970,9 @@ async function main() {
       state.pos = [x, y, z]; state.yaw = yaw; state.pitch = pitch;
     },
     terrainH: terrainHJS,
-    // rg16float はテクセルあたり half が2つ返る (r,g 交互のフラット配列)
+    // rgba8unorm はテクセルあたり 4 値 (r,g,b,a 交互のフラット配列、0..1)、r16float は half が 1 つ
     async readTex(tex, layer, x, y, w) {
-      const bpt = tex.format === 'rg16float' ? 4 : 2;
+      const bpt = tex.format === 'rgba8unorm' ? 4 : 2;
       const buf = device.createBuffer({ size: Math.max(w * bpt, 256), usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
       const enc = device.createCommandEncoder();
       enc.copyTextureToBuffer(
@@ -958,6 +981,11 @@ async function main() {
         [w, 1, 1]);
       device.queue.submit([enc.finish()]);
       await buf.mapAsync(GPUMapMode.READ);
+      if (tex.format === 'rgba8unorm') {
+        const out = [...new Uint8Array(buf.getMappedRange().slice(0, w * bpt))].map(v => v / 255);
+        buf.unmap();
+        return out;
+      }
       const h = new Uint16Array(buf.getMappedRange().slice(0, w * bpt));
       const out = [...h].map(v => {
         const s = (v & 0x8000) ? -1 : 1, e = (v >> 10) & 0x1f, m = v & 0x3ff;
@@ -1088,7 +1116,7 @@ async function main() {
     uData.set([up[0], up[1], up[2], state.windOn ? 1 : 0], 28);
     uData.set([sun[0], sun[1], sun[2], state.barsOn ? 1 : 0], 32);
     uData.set([state.kOpacity, SLAB_H, mean, detMean], 36);
-    uData.set([state.flatGround ? 1 : 0, state.lMin, 0, 0], 40);
+    uData.set([state.flatGround ? 1 : 0, state.lMin, state.detailMode, 0], 40);
     uData.set([state.gRadius * (1 - state.gSoft), state.gRadius, state.bpc, state.gSigma], 44);
     uData.set([state.gHeight, state.gWidth, state.gDens, state.dither ? 1 : 0], 48);
     device.queue.writeBuffer(uBuf, 0, uData);
@@ -1127,7 +1155,7 @@ async function main() {
       `fps ${state.fps.toFixed(0)}  density ${densMs.toFixed(0)}ms  blur ${blurMs.toFixed(0)}ms\n` +
       `ndir ${NDIR}  dtex ${DETAIL_TEX}px / dspan ${DETAIL_SPAN}m (${(DETAIL_SPAN / DETAIL_TEX * 100).toFixed(1)}cm/texel)  mem ${detMB.toFixed(1)}MB\n` +
       `bars[B] ${state.barsOn ? 'on' : 'off'}  wind[V] ${state.windOn ? 'on' : 'off'}  ` +
-      `viewer[T] ${state.rhoOverlay ? 'on' : 'off'}  flat[N] ${state.flatGround ? 'on' : 'off'}\n` +
+      `viewer[T] ${state.rhoOverlay ? 'on' : 'off'}  flat[N] ${state.flatGround ? 'on' : 'off'}  detail[I] ${['long+iso', 'long/short+iso', 'long/short'][state.detailMode]} (short ${SHORT_RATIO} gain ${SHORT_GAIN})\n` +
       `opacity[7/8] ${state.kOpacity.toFixed(1)}  lmin[-/=] ${state.lMin.toFixed(2)}m  sun[1/2] ${(state.sunAz * 180 / Math.PI).toFixed(0)}°\n` +
       `geom[G] ${state.geomOn ? 'on' : 'off'}  blades ${(chunksInfo.blades / 1000).toFixed(0)}k / ${chunksInfo.n} chunks  ` +
       `bpc[3/4] ${state.bpc}  radius[5/6] ${state.gRadius.toFixed(0)}m  soft[,/.] ${state.gSoft.toFixed(2)}  sigma[9/0] ${state.gSigma.toFixed(1)}  dither[X] ${state.dither ? 'on' : 'off'}\n` +
