@@ -327,30 +327,37 @@ fn surfaceColor(wp: vec3f, V: vec3f, dist: f32) -> vec3f {
   if (u.misc.x > 0.5) { gAlb = vec3f(0.17, 0.14, 0.11); }
   var c = gAlb * (SUN_COL*ndl + SKY_AMB*0.9);
   if (u.sunDir.w > 0.5) {
-    // 視線方位に沿ってぼかした密度を引く。方位量子化は隣接2方位の lerp
-    // (ぼかしは対称なので 180° 周期、符号処理は不要)
-    var rh = V.xz;
-    let lh = length(rh);
-    rh = select(rh / lh, vec2f(1.0, 0.0), lh < 1e-5);
-    let thetaView = atan2(rh.y, rh.x);
     var windW = vec2f(0.0);
+    var axis = N;
     if (u.camUp.w > 0.5) {
-      // 風: 参照位置のオフセット = 筋全体の平行移動。根元固定のせん断ではないが
-      // 遠景では株の揺らぎとして通る。位相場は近景ブレードの風と同じ式で整合させる
+      // 風: 参照位置のオフセット (筋全体の平行移動) と、葉の軸の傾き。位相場は近景ブレードの
+      // 風と同じ式で整合させ、軸の傾きも先端の変位がブレードと一致するように取る
       let time = u.camPos.w;
       let wamp = 0.10*sin(time*1.9 + wp.x*0.35 + wp.z*0.22) + 0.05*sin(time*3.7 + wp.z*0.53 + wp.x*0.31);
       windW = vec2f(0.86, 0.5) * (wamp * 0.6);
+      let tipH = max(u.geo2.x * 0.5 * ${1 + G_CF}, 0.05);
+      axis = normalize(N + vec3f(windW.x, 0.0, windW.y) / tipH);
     }
+    // 葉の像は軸を視線に沿って地面へ落としたものなので、ぼかし方位はその投影から取る。
+    // 立った葉なら視線方位 (カメラ足元から放射状) に一致し、倒れた葉は視線が立つほど風下へ
+    // 回る。向きが変わらないと、風はテクスチャの平行移動にしか見えない。
+    // 方位量子化は隣接2方位の lerp (ぼかしは対称なので 180° 周期、符号処理は不要)
+    var rh = axis.xz - axis.y * V.xz / min(V.y, -1e-3);
+    let lh = length(rh);  // 像の長さ (軸長 1 あたり)。視線が軸に沿う点で 0
+    rh = select(rh / lh, vec2f(1.0, 0.0), lh < 1e-5);
+    let thetaView = atan2(rh.y, rh.x);
     // 2格子を半量子 (π/2NDIR) 回転差で重ねる: 回転角が格子と非通約なので合成場は
     // 非周期になり、方向量子化の誤差も格子間で非相関化される。
     // 2枚の和 (÷2) を表現したい場そのものとみなし、分散の √2 復元はしない
     // (復元すると最大値が範囲を超え、濃部にベタ塗りが出る)
-    // 筋はカメラ足元を中心に放射状に並ぶので、足元の近くでは 1 本の筋の中で方位が曲がり、
-    // 放射模様として見える。そこは方向ぼかしなしの等方タイルへ混ぜる (タイル平均へ寄せると
-    // 模様の無い円盤がカメラに追従して見える)。範囲は「水平 2m」と「鉛直から tan 0.1 の円錐」の
-    // soft な min: 地上では筋長 (~0.8m) の数倍、高高度では狭い円錐なので追加フェッチは少ない
-    let rHoriz = distance(wp.xz, u.camPos.xz);
-    let isoW = 1.0 - smoothstep(0.0, 0.1, rHoriz / (20.0 + abs(wp.y - u.camPos.y)));
+    // 像が潰れる点 (視線が軸に沿う所。立った葉ならカメラ足元) の周りでは 1 本の筋の中で方位が
+    // 曲がり、放射模様として見える。そこは方向ぼかしなしの等方タイルへ混ぜる (タイル平均へ
+    // 寄せると模様の無い円盤がカメラに追従して見える)。範囲は像の長さ lh で取るので、風で
+    // 軸が倒れて潰れる点が動いても、場所ごとに違っても追従する。立った葉では lh = 水平距離/Δy
+    // なので、「水平 2m」と「鉛直から tan 0.1 の円錐」の soft な min になる: 地上では筋長
+    // (~0.8m) の数倍、高高度では狭い円錐なので追加フェッチは少ない
+    let dy = abs(wp.y - u.camPos.y);
+    let isoW = 1.0 - smoothstep(0.0, 0.1, lh * dy / (20.0 + dy));
     let dsum = (latticeDetail(wp.xz, windW, thetaView, 0.0, isoW)
               + latticeDetail(wp.xz, windW, thetaView, ${Math.PI / (2 * NDIR)}, isoW)) * 0.5;
     let detN = dsum / max(u.par.w, 1e-3);
