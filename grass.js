@@ -236,9 +236,10 @@ struct U {
   camUp: vec4f,     // w: windOn
   sunDir: vec4f,    // w: barsOn
   par: vec4f,       // kOpacity, slabH, rhoMean, detailMean
-  misc: vec4f,      // flatGround, 偽草の足元線分長 L の下限 (真上から見た葉の見かけの厚み), 詳細モード (0: 長+等方, 1: 長/短+等方, 2: 長/短), -
+  misc: vec4f,      // flatGround, 偽草の足元線分長 L の下限 (真上から見た葉の見かけの厚み), 詳細モード (0: 長+等方, 1: 長/短+等方, 2: 長/短), 突風の暗さの視線依存
   geo: vec4f,       // 密度フェード開始距離, 終了距離, bladesPerCell, sigma (葉の光学的厚さ)
   geo2: vec4f,      // height, width, 株の密度ゲイン (色の明暗), dither
+  wind: vec4f,      // 突風で倒す量, 突風の暗さ, テクスチャのスクロール位相 [tile], タイル [m]
 }
 fn rhoUV(p: vec2f) -> vec2f {
   return (p - vec2f(${REG_MIN}.0)) / ${REG_SPAN}.0;
@@ -252,6 +253,34 @@ const SCENE_WGSL = COMMON + /* wgsl */`
 @group(0) @binding(3) var detailArr: texture_2d_array<f32>;
 @group(0) @binding(4) var sampR: sampler;
 @group(0) @binding(5) var<storage, read> chunks: array<vec4f>;  // ox, oz, cx, cz
+@group(0) @binding(6) var windTex: texture_2d<f32>;
+@group(0) @binding(7) var windSamp: sampler;
+
+// 風の場。突風が一方向に走るので向きは固定で、強さ [0,1] だけを突風テクスチャ (windtex.js) の
+// r から読む。テクスチャ空間の +x が風下
+const WIND_DIR = vec2f(0.86449, 0.50261);
+fn windUV(p: vec2f) -> vec2f {
+  let q = vec2f(dot(p, WIND_DIR), -WIND_DIR.y*p.x + WIND_DIR.x*p.y);
+  return q / u.wind.w - vec2f(u.wind.z, 0.0);
+}
+// 頂点段では textureSampleLevel しか呼べない
+fn windField(p: vec2f) -> f32 {
+  return textureSample(windTex, windSamp, windUV(p)).r;
+}
+fn windFieldLevel(p: vec2f) -> f32 {
+  return textureSampleLevel(windTex, windSamp, windUV(p), 0.0).r;
+}
+// 葉を倒す水平ベクトル
+fn windAt(gust: f32) -> vec2f {
+  return WIND_DIR * (u.wind.x * gust);
+}
+// 突風の中の草の明るさ倍率。基本は暗くなり、風下を見ると (葉の列を覗き込んで根元が見える) 更に暗く、
+// 風上を見ると (先端の面が閉じる) 戻る
+fn windGain(gust: f32, Vh: vec2f) -> f32 {
+  let lh = length(Vh);
+  let along = select(0.0, dot(Vh, WIND_DIR) / lh, lh > 1e-5);
+  return 1.0 - u.wind.y * gust * (1.0 + u.misc.w * along);
+}
 
 // --- sky ---
 struct SkyOut { @builtin(position) pos: vec4f, @location(0) ndc: vec2f }
@@ -332,17 +361,13 @@ fn surfaceColor(wp: vec3f, V: vec3f, dist: f32) -> vec3f {
   if (u.misc.x > 0.5) { gAlb = vec3f(0.17, 0.14, 0.11); }
   var c = gAlb * (SUN_COL*ndl + SKY_AMB*0.9);
   if (u.sunDir.w > 0.5) {
-    var windW = vec2f(0.0);
-    var axis = N;
-    if (u.camUp.w > 0.5) {
-      // 風: 参照位置のオフセット (筋全体の平行移動) と、葉の軸の傾き。位相場は近景ブレードの
-      // 風と同じ式で整合させ、軸の傾きも先端の変位がブレードと一致するように取る
-      let time = u.camPos.w;
-      let wamp = 0.10*sin(time*1.9 + wp.x*0.35 + wp.z*0.22) + 0.05*sin(time*3.7 + wp.z*0.53 + wp.x*0.31);
-      windW = vec2f(0.86, 0.5) * (wamp * 0.6);
-      let tipH = max(u.geo2.x * 0.5 * ${1 + G_CF}, 0.05);
-      axis = normalize(N + vec3f(windW.x, 0.0, windW.y) / tipH);
-    }
+    // 風: 参照位置のオフセット (筋全体の平行移動) と、葉の軸の傾き。同じ場・同じ倒し量を
+    // 近景ブレードにも使う
+    var gust = 0.0;
+    if (u.camUp.w > 0.5) { gust = windField(wp.xz); }
+    let w = windAt(gust);
+    let windW = w * 0.09;
+    let axis = normalize(N + vec3f(w.x, 0.0, w.y) * 0.45);
     // 葉の像は軸を視線に沿って地面へ落としたものなので、ぼかし方位はその投影から取る。
     // 立った葉なら視線方位 (カメラ足元から放射状) に一致し、倒れた葉は視線が立つほど風下へ
     // 回る。向きが変わらないと、風はテクスチャの平行移動にしか見えない。
@@ -388,7 +413,7 @@ fn surfaceColor(wp: vec3f, V: vec3f, dist: f32) -> vec3f {
     let alpha = 1.0 - exp(-tau);
     // 高密度側でも飽和しない線形カーブにして、密草地帯の中の濃淡を残す
     let shade = 1.35 - 0.52 * min(rd, 2.2);
-    var galb = mix(ROOT_COL, TIP_COL, 0.6) * shade;
+    var galb = mix(ROOT_COL, TIP_COL, 0.6) * shade * windGain(gust, V.xz);
     if (u.misc.x < 0.5) { galb *= patchTint(wp.xz); }
     var glit = galb * (SUN_COL*ndl*0.9 + SKY_AMB*0.75);
     glit += TRANS_COL * pow(max(dot(V, u.sunDir.xyz), 0.0), 6.0) * 0.25;
@@ -452,14 +477,14 @@ fn densAt(d: f32) -> f32 { return 1.0 - smoothstep(u.geo.x, u.geo.y, d); }
   let H = u.geo2.x * (0.6 + 0.8*h2);
   let r = u.geo2.y * 0.5 * (0.7 + 0.6*h3);
   let a = H * 0.5;
-  let tipH = a * ${1 + G_CF};
   let N = terrainN(bxz);
   var axis = normalize(mix(N, vec3f(0.0, 1.0, 0.0), 0.5)) + vec3f(h2 - 0.5, 0.0, h3 - 0.5) * 0.4;
+  var gust = 0.0;
   if (u.camUp.w > 0.5) {
-    // 偽草の筋の平行移動量 (0.6·wamp) と先端の変位が一致するよう軸を傾ける
-    let time = u.camPos.w;
-    let wamp = 0.10*sin(time*1.9 + bxz.x*0.35 + bxz.y*0.22) + 0.05*sin(time*3.7 + bxz.y*0.53 + bxz.x*0.31);
-    axis += vec3f(0.86, 0.0, 0.5) * (wamp * 0.6 / max(tipH, 0.05));
+    // 偽草 (surfaceColor) と同じ場・同じ倒し量
+    gust = windFieldLevel(bxz);
+    let w = windAt(gust);
+    axis += vec3f(w.x, 0.0, w.y) * 0.45;
   }
   axis = normalize(axis);
   let center = base + axis * (a * ${G_CF});
@@ -493,7 +518,7 @@ fn densAt(d: f32) -> f32 { return 1.0 - smoothstep(u.geo.x, u.geo.y, d); }
   let ndl = max(dot(N, sun), 0.0);
   let detB = u.geo2.z * (0.8 + 0.6*h2);
   let shade = 1.35 - 0.52 * min(rho * (0.25 + 0.75*detB), 2.2);
-  var galb = mix(ROOT_COL, TIP_COL, 0.6) * shade;
+  var galb = mix(ROOT_COL, TIP_COL, 0.6) * shade * windGain(gust, Vc.xz);
   if (u.misc.x < 0.5) { galb *= patchTint(bxz); }
   o.col = galb * (SUN_COL*ndl*0.9 + SKY_AMB*0.75)
         + TRANS_COL * pow(max(dot(Vc, sun), 0.0), 6.0) * 0.25;
@@ -814,6 +839,7 @@ async function main() {
   }
   device.popErrorScope().then(e => { if (e) console.error('bake validation:', e.message); });
   const blurMs = performance.now() - t1;
+  const wind = createWindTexture(device, WIND);
 
   // --- scene pipelines (MSAA, canvas直描き) ---
   const sceneMod = device.createShaderModule({ code: SCENE_WGSL });
@@ -826,9 +852,11 @@ async function main() {
       { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { viewDimension: '2d-array' } },
       { binding: 4, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
       { binding: 5, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
+      { binding: 6, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, texture: {} },
+      { binding: 7, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, sampler: {} },
     ],
   });
-  const uBuf = device.createBuffer({ size: 208, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const uBuf = device.createBuffer({ size: 224, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const chunkBuf = device.createBuffer({ size: G_MAX_CHUNKS * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
   const chunkData = new Float32Array(G_MAX_CHUNKS * 4);
   const bindA = device.createBindGroup({
@@ -840,6 +868,8 @@ async function main() {
       { binding: 3, resource: detailArr.createView({ dimension: '2d-array' }) },
       { binding: 4, resource: sampR },
       { binding: 5, resource: { buffer: chunkBuf } },
+      { binding: 6, resource: wind.tex.createView() },
+      { binding: 7, resource: wind.samp },
     ],
   });
   const pLayoutA = device.createPipelineLayout({ bindGroupLayouts: [layoutA] });
@@ -899,6 +929,8 @@ async function main() {
     keys: new Set(),
     barsOn: true, windOn: true, rhoOverlay: false, paused: false, flatGround: false,
     detailMode: parseInt(q.get('dmode') || '1', 10),
+    windBend: parseFloat(q.get('windBend') || '1.5'), windDark: parseFloat(q.get('windDark') || '0.18'),
+    windSpeed: parseFloat(q.get('windSpeed') || '6'), windView: parseFloat(q.get('windView') || '0.6'),
     sunAz: 2.4, sunEl: 0.66, kOpacity: 4.0,
     geomOn: true, bpc: 4, gRadius: 25, gSoft: 0.6, gSigma: 3.0, gDens: 1.0, dither: true,
     gHeight: parseFloat(q.get('gh') || '0.5'), gWidth: parseFloat(q.get('gw') || '0.1'),
@@ -999,7 +1031,7 @@ async function main() {
   };
 
   // --- frame loop ---
-  const uData = new Float32Array(52);
+  const uData = new Float32Array(56);
 
   // チャンク AABB の 8 頂点が同じクリップ平面の外側に揃ったら不可視
   function chunkVisible(vp, ox, oz, y0, y1) {
@@ -1116,9 +1148,10 @@ async function main() {
     uData.set([up[0], up[1], up[2], state.windOn ? 1 : 0], 28);
     uData.set([sun[0], sun[1], sun[2], state.barsOn ? 1 : 0], 32);
     uData.set([state.kOpacity, SLAB_H, mean, detMean], 36);
-    uData.set([state.flatGround ? 1 : 0, state.lMin, state.detailMode, 0], 40);
+    uData.set([state.flatGround ? 1 : 0, state.lMin, state.detailMode, state.windView], 40);
     uData.set([state.gRadius * (1 - state.gSoft), state.gRadius, state.bpc, state.gSigma], 44);
     uData.set([state.gHeight, state.gWidth, state.gDens, state.dither ? 1 : 0], 48);
+    uData.set([state.windBend, state.windDark, (state.time * state.windSpeed / wind.tile) % 1, wind.tile], 52);
     device.queue.writeBuffer(uBuf, 0, uData);
     const chunksInfo = state.geomOn ? collectChunks(viewProj, pos) : { draws: [], n: 0, blades: 0 };
     if (chunksInfo.n > 0) device.queue.writeBuffer(chunkBuf, 0, chunkData, 0, chunksInfo.n * 4);
@@ -1154,7 +1187,7 @@ async function main() {
     hud.textContent =
       `fps ${state.fps.toFixed(0)}  density ${densMs.toFixed(0)}ms  blur ${blurMs.toFixed(0)}ms\n` +
       `ndir ${NDIR}  dtex ${DETAIL_TEX}px / dspan ${DETAIL_SPAN}m (${(DETAIL_SPAN / DETAIL_TEX * 100).toFixed(1)}cm/texel)  mem ${detMB.toFixed(1)}MB\n` +
-      `bars[B] ${state.barsOn ? 'on' : 'off'}  wind[V] ${state.windOn ? 'on' : 'off'}  ` +
+      `bars[B] ${state.barsOn ? 'on' : 'off'}  wind[V] ${state.windOn ? `bend ${state.windBend} dark ${state.windDark} ${state.windSpeed}m/s (${wind.cpuMs.toFixed(0)}ms)` : 'off'}  ` +
       `viewer[T] ${state.rhoOverlay ? 'on' : 'off'}  flat[N] ${state.flatGround ? 'on' : 'off'}  detail[I] ${['long+iso', 'long/short+iso', 'long/short'][state.detailMode]} (short ${SHORT_RATIO} gain ${SHORT_GAIN})\n` +
       `opacity[7/8] ${state.kOpacity.toFixed(1)}  lmin[-/=] ${state.lMin.toFixed(2)}m  sun[1/2] ${(state.sunAz * 180 / Math.PI).toFixed(0)}°\n` +
       `geom[G] ${state.geomOn ? 'on' : 'off'}  blades ${(chunksInfo.blades / 1000).toFixed(0)}k / ${chunksInfo.n} chunks  ` +
