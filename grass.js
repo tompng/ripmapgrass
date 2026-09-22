@@ -256,30 +256,36 @@ const SCENE_WGSL = COMMON + /* wgsl */`
 @group(0) @binding(6) var windTex: texture_2d<f32>;
 @group(0) @binding(7) var windSamp: sampler;
 
-// 風の場。突風が一方向に走るので向きは固定で、強さ [0,1] だけを突風テクスチャ (windtex.js) の
-// r から読む。テクスチャ空間の +x が風下
+// 風の場。突風が一方向に走るので向きは固定で、突風テクスチャ (windtex.js) の r が風向成分 [0,1]、
+// g が横成分 (0.5 ± 0.5、風向成分を事前に掛けてある)。テクスチャ空間の +x が風下
 const WIND_DIR = vec2f(0.86449, 0.50261);
+const WIND_PERP = vec2f(-0.50261, 0.86449);
 fn windUV(p: vec2f) -> vec2f {
   let q = vec2f(dot(p, WIND_DIR), -WIND_DIR.y*p.x + WIND_DIR.x*p.y);
   return q / u.wind.w - vec2f(u.wind.z, 0.0);
 }
-// 頂点段では textureSampleLevel しか呼べない
-fn windField(p: vec2f) -> f32 {
-  return textureSample(windTex, windSamp, windUV(p)).r;
+// (風向成分, 横成分)。頂点段では textureSampleLevel しか呼べない
+fn windDecode(t: vec2f) -> vec2f {
+  return vec2f(t.x, t.y * 2.0 - 1.0);
 }
-fn windFieldLevel(p: vec2f) -> f32 {
-  return textureSampleLevel(windTex, windSamp, windUV(p), 0.0).r;
+fn windField(p: vec2f) -> vec2f {
+  return windDecode(textureSample(windTex, windSamp, windUV(p)).rg);
+}
+fn windFieldLevel(p: vec2f) -> vec2f {
+  return windDecode(textureSampleLevel(windTex, windSamp, windUV(p), 0.0).rg);
 }
 // 葉を倒す水平ベクトル
-fn windAt(gust: f32) -> vec2f {
-  return WIND_DIR * (u.wind.x * gust);
+fn windAt(wf: vec2f) -> vec2f {
+  return (WIND_DIR * wf.x + WIND_PERP * wf.y) * u.wind.x;
 }
-// 突風の中の草の明るさ倍率。基本は暗くなり、風下を見ると (葉の列を覗き込んで根元が見える) 更に暗く、
-// 風上を見ると (先端の面が閉じる) 戻る
-fn windGain(gust: f32, Vh: vec2f) -> f32 {
+// 風の中の草の明るさ倍率。倒れの大きさで暗くなり、倒れる向きに視線が沿うと (葉の列を覗き込んで
+// 根元が見える) 更に暗く、向かってくる向きだと (先端の面が閉じる) 戻る
+fn windGain(wf: vec2f, Vh: vec2f) -> f32 {
+  let wv = WIND_DIR * wf.x + WIND_PERP * wf.y;
+  let mag = length(wv);
   let lh = length(Vh);
-  let along = select(0.0, dot(Vh, WIND_DIR) / lh, lh > 1e-5);
-  return 1.0 - u.wind.y * gust * (1.0 + u.misc.w * along);
+  let along = select(0.0, dot(Vh, wv) / (lh * mag), lh > 1e-5 && mag > 1e-5);
+  return 1.0 - u.wind.y * mag * (1.0 + u.misc.w * along);
 }
 
 // --- sky ---
@@ -363,9 +369,9 @@ fn surfaceColor(wp: vec3f, V: vec3f, dist: f32) -> vec3f {
   if (u.sunDir.w > 0.5) {
     // 風: 参照位置のオフセット (筋全体の平行移動) と、葉の軸の傾き。同じ場・同じ倒し量を
     // 近景ブレードにも使う
-    var gust = 0.0;
-    if (u.camUp.w > 0.5) { gust = windField(wp.xz); }
-    let w = windAt(gust);
+    var wf = vec2f(0.0);
+    if (u.camUp.w > 0.5) { wf = windField(wp.xz); }
+    let w = windAt(wf);
     let windW = w * 0.09;
     let axis = normalize(N + vec3f(w.x, 0.0, w.y) * 0.45);
     // 葉の像は軸を視線に沿って地面へ落としたものなので、ぼかし方位はその投影から取る。
@@ -413,7 +419,7 @@ fn surfaceColor(wp: vec3f, V: vec3f, dist: f32) -> vec3f {
     let alpha = 1.0 - exp(-tau);
     // 高密度側でも飽和しない線形カーブにして、密草地帯の中の濃淡を残す
     let shade = 1.35 - 0.52 * min(rd, 2.2);
-    var galb = mix(ROOT_COL, TIP_COL, 0.6) * shade * windGain(gust, V.xz);
+    var galb = mix(ROOT_COL, TIP_COL, 0.6) * shade * windGain(wf, V.xz);
     if (u.misc.x < 0.5) { galb *= patchTint(wp.xz); }
     var glit = galb * (SUN_COL*ndl*0.9 + SKY_AMB*0.75);
     glit += TRANS_COL * pow(max(dot(V, u.sunDir.xyz), 0.0), 6.0) * 0.25;
@@ -479,11 +485,11 @@ fn densAt(d: f32) -> f32 { return 1.0 - smoothstep(u.geo.x, u.geo.y, d); }
   let a = H * 0.5;
   let N = terrainN(bxz);
   var axis = normalize(mix(N, vec3f(0.0, 1.0, 0.0), 0.5)) + vec3f(h2 - 0.5, 0.0, h3 - 0.5) * 0.4;
-  var gust = 0.0;
+  var wf = vec2f(0.0);
   if (u.camUp.w > 0.5) {
     // 偽草 (surfaceColor) と同じ場・同じ倒し量
-    gust = windFieldLevel(bxz);
-    let w = windAt(gust);
+    wf = windFieldLevel(bxz);
+    let w = windAt(wf);
     axis += vec3f(w.x, 0.0, w.y) * 0.45;
   }
   axis = normalize(axis);
@@ -518,7 +524,7 @@ fn densAt(d: f32) -> f32 { return 1.0 - smoothstep(u.geo.x, u.geo.y, d); }
   let ndl = max(dot(N, sun), 0.0);
   let detB = u.geo2.z * (0.8 + 0.6*h2);
   let shade = 1.35 - 0.52 * min(rho * (0.25 + 0.75*detB), 2.2);
-  var galb = mix(ROOT_COL, TIP_COL, 0.6) * shade * windGain(gust, Vc.xz);
+  var galb = mix(ROOT_COL, TIP_COL, 0.6) * shade * windGain(wf, Vc.xz);
   if (u.misc.x < 0.5) { galb *= patchTint(bxz); }
   o.col = galb * (SUN_COL*ndl*0.9 + SKY_AMB*0.75)
         + TRANS_COL * pow(max(dot(Vc, sun), 0.0), 6.0) * 0.25;

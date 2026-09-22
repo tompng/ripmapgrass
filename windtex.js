@@ -20,6 +20,8 @@ const WIND = {
   tail: 20,         // 尾の減衰長 [m]
   detailScale: 3,   // 足す細かいノイズの波長 = wave0 / detailScale
   detailAmp: 0.75,  // 細かいノイズの振幅 (弧の高さ 1 に対するピーク比)
+  latScale: 2.5,    // g: 横揺れノイズの波長 = 細かいノイズの波長 / latScale
+  latAmp: 0.75,     // 横揺れの振幅 (風向成分 1 に対する比)。風向成分を事前に掛けてある
   spread: 0.5,      // 1 texel 伝播ごとの横ぼかし σ [m]。距離 L の尾で σ ≈ spread·√(L/texel)
   seed: 1,
 }
@@ -126,7 +128,7 @@ function bandNoise(TEX, k0, band, waves, rand) {
   return normalize(n)
 }
 
-// 戻り値 rg: [gust, noise 表示用] を texel ごとに詰めた Float32Array (0..1)
+// 戻り値 rg: [風向成分 0..1, 横成分 (0.5 ± 0.5、風向成分を事前に掛けたもの)] を texel ごとに詰めた Float32Array
 function genWindField(p = WIND) {
   const { TEX, TILE } = p
   const texel = TILE / TEX
@@ -175,18 +177,19 @@ function genWindField(p = WIND) {
 
   // 弧より細かい等方ノイズを弱く重ねる
   const detail = perlinNoise(TEX, TILE / p.wave0 * p.detailScale, rand)
+  // 横揺れ: 細かいノイズよりさらに短い等方ノイズに風向成分を掛ける (乱流強度は風速に比例する)
+  const lat = perlinNoise(TEX, TILE / p.wave0 * p.detailScale * p.latScale, rand)
   const out = new Float32Array(TEX * TEX * 2)
   for (let k = 0; k < wake.length; k++) {
-    out[k * 2] = Math.min(1, Math.max(0, wake[k] + p.detailAmp * detail[k] / 3))
-    out[k * 2 + 1] = Math.min(1, Math.max(0, 0.5 + n[k] * 0.2))
+    const gust = Math.min(1, Math.max(0, wake[k] + p.detailAmp * detail[k] / 3))
+    out[k * 2] = gust
+    out[k * 2 + 1] = Math.min(1, Math.max(0, 0.5 + 0.5 * gust * p.latAmp * lat[k] / 3))
   }
   return { rg: out, size: TEX, texel }
 }
 
 // rg8unorm + ミップ。ミップが無いと遠方で突風の縁がちらつく
-function createWindTexture(device, p = WIND) {
-  const t0 = performance.now()
-  const f = genWindField(p)
+function uploadWindField(device, tex, f) {
   const levels = []
   let n = f.size
   const base = new Uint8Array(n * n * 2)
@@ -206,17 +209,22 @@ function createWindTexture(device, p = WIND) {
     }
     levels.push(dst)
   }
-  const tex = device.createTexture({
-    size: [f.size, f.size], format: 'rg8unorm', mipLevelCount: levels.length,
-    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-  })
   levels.forEach((data, mipLevel) => {
     const m = f.size >> mipLevel
     device.queue.writeTexture({ texture: tex, mipLevel }, data, { bytesPerRow: m * 2, rowsPerImage: m }, [m, m, 1])
+  })
+}
+
+function createWindTexture(device, p = WIND) {
+  const t0 = performance.now()
+  const tex = device.createTexture({
+    size: [p.TEX, p.TEX], format: 'rg8unorm', mipLevelCount: Math.log2(p.TEX) + 1,
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
   })
   const samp = device.createSampler({
     magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear',
     addressModeU: 'repeat', addressModeV: 'repeat', maxAnisotropy: 8,
   })
+  uploadWindField(device, tex, genWindField(p))
   return { tex, samp, tile: p.TILE, cpuMs: performance.now() - t0 }
 }
