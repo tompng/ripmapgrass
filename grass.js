@@ -41,6 +41,32 @@ const G_BAND = 2;
 // 楕円体中心の根元からの高さ (半長軸比)。1 未満なら下部が地中に沈み、地面で切れる
 const G_CF = parseFloat(q.get('gcf') || '0.75');
 
+// 草株 (tussock) の実験ノブ。URL パラメータで上書き
+const tq = (name, def) => parseFloat(q.get(name) ?? def);
+const T_P = {
+  r: tq('tr', 0.55),       // 半径 [m]
+  h: tq('th', 0.6),        // 地面からの高さ [m]
+  cf: tq('tcf', 0.3),      // 楕円体中心の高さ (半長軸比)。残りは地中
+  cell: tq('tcell', 4),    // 配置セル [m]
+  prob: tq('tprob', 0.6),  // セルあたりの出現確率 (マクロ密度で変調)
+  R: tq('tR', 150),        // 描画半径 [m]
+  kc: tq('tkc', 3),        // 芯 (暗い塊) の光学的厚さ。弦が直径のとき 1−exp(−kc)
+  ks: tq('tks', 0.7),      // 葉の殻の光学的厚さ。正面で密度 1 のとき 1−exp(−ks)
+  lmax: tq('tlmax', 1),    // 殻の見かけ厚みの上限 (正面を 1 として、縁のグレージングで伸びる分)
+  rim0: tq('trim0', 0.6),  // 縁のしきい値が立ち上がる衝突径数 ρ (正射影の円板での中心からの距離)
+  rimT: tq('trimt', 2.0),  // 輪郭 (ρ = 1) での密度しきい値 (平均 1、筋のピーク ~2.4)
+  wrap: tq('twrap', 0.5),  // 楕円体法線の wrap lighting 量 (影側を持ち上げる)
+  leaf: (q.get('tleaf') || '0.46,0.46,0.17').split(',').map(Number),  // 葉の色 (単色、草原と別種のオリーブ)
+  core: (q.get('tcore') || '0.08,0.06,0.03').split(',').map(Number),  // 芯の色
+  k: tq('tk', 3),          // 方位図法の倍率 (赤道 1 周ぶんの弧に貼るタイル数)
+  iso: tq('tiso', 0.25),   // 等方タイル (針を真正面から見た点々) へ混ぜる像の長さの上限
+  nb: tq('tnb', 24),       // 株あたりのブレード数
+  bl: tq('tbl', 0.35),     // ブレード長 [m]
+  bw: tq('tbw', 0.012),    // ブレード幅 [m]
+  br: tq('tbr', 30),       // ブレード描画半径 [m]
+  debug: tq('tdebug', 0),  // 1: 詳細密度, 2: 表面 uv の格子, 3: 像の長さ (R) / 等方 (G) / 短 (B) の重み
+};
+
 const hud = document.getElementById('hud');
 const canvas = document.getElementById('c');
 
@@ -240,6 +266,13 @@ struct U {
   geo: vec4f,       // 密度フェード開始距離, 終了距離, bladesPerCell, sigma (葉の光学的厚さ)
   geo2: vec4f,      // height, width, 株の密度ゲイン (色の明暗), dither
   wind: vec4f,      // 突風で倒す量, 突風の暗さ, テクスチャのスクロール位相 [tile], タイル [m]
+  tus: vec4f,       // 株の半径, 高さ, 芯の光学的厚さ kc, 殻の光学的厚さ ks
+  tus2: vec4f,      // wrap lighting 量, 株あたりブレード数, ブレード長, ブレード幅
+  tus3: vec4f,      // 株グリッドの一辺のセル数, セル [m], セルあたり確率, 描画半径
+  tus4: vec4f,      // ブレードグリッドの一辺のセル数, ブレード描画半径, 殻の見かけ厚みの上限, 中心の高さ (半長軸比)
+  tus5: vec4f,      // 方位図法の倍率, デバッグ表示, 縁のしきい値が立ち上がる ρ, 等方へ混ぜる像の長さの上限
+  tusLeaf: vec4f,   // 葉の色, 輪郭での密度しきい値
+  tusCore: vec4f,   // 芯の色, -
 }
 fn rhoUV(p: vec2f) -> vec2f {
   return (p - vec2f(${REG_MIN}.0)) / ${REG_SPAN}.0;
@@ -494,23 +527,8 @@ fn densAt(d: f32) -> f32 { return 1.0 - smoothstep(u.geo.x, u.geo.y, d); }
   }
   axis = normalize(axis);
   let center = base + axis * (a * ${G_CF});
-  // カメラ方向に正対するクアッド。楕円体の正射影の半幅 sqrt(v^T M v) に、
-  // 透視でシルエットが中心面より外に出る分の余裕を掛ける
-  let toC = center - u.camPos.xyz;
-  let dc = length(toC);
-  let Vc = toC / dc;
-  var Rq = cross(Vc, vec3f(0.0, 1.0, 0.0));
-  Rq = select(normalize(Rq), vec3f(1.0, 0.0, 0.0), dot(Rq, Rq) < 1e-6);
-  let Uq = cross(Rq, Vc);
-  let ra = dot(Rq, axis);
-  let ua = dot(Uq, axis);
-  let hw = sqrt(a*a*ra*ra + r*r*(1.0 - ra*ra));
-  let hh = sqrt(a*a*ua*ua + r*r*(1.0 - ua*ua));
-  let ext = max(a, r);
-  let m = min(dc / sqrt(max(dc*dc - ext*ext, 0.01*ext*ext)), 3.0) * 1.05 * step(1e-4, fade);
-  let cx = f32(vi & 1u) * 2.0 - 1.0;
-  let cy = f32(vi >> 1u) * 2.0 - 1.0;
-  let wp = center + Rq * (cx * hw * m) + Uq * (cy * hh * m);
+  let Vc = normalize(center - u.camPos.xyz);
+  let wp = impostorQuad(center, axis, a, r, vi, fade);
   var o: GOut;
   o.pos = u.viewProj * vec4f(wp, 1.0);
   o.wp = wp;
@@ -535,11 +553,50 @@ fn densAt(d: f32) -> f32 { return 1.0 - smoothstep(u.geo.x, u.geo.y, d); }
 @fragment fn fsGrass(in: GOut) -> @location(0) vec4f {
   let O = u.camPos.xyz;
   let D = normalize(in.wp - O);
-  let A = normalize(in.axis);
-  let a = in.prm.x;
   let r = in.prm.y;
-  // 楕円体を単位球に写す座標 (軸方向 1/a, 直交方向 1/r) でレイと交差
-  let o = O - in.center;
+  let h = ellipsoidHit(O, D, in.center, normalize(in.axis), in.prm.x, r);
+  if (!h.hit) { discard; }
+  // 密度 (1-s²) の球内線積分は単位球での半弦 hc の 3 乗に比例する。
+  // 1 乗ぶんを世界での半弦 Lw/r に置き換え、軸方向に長い楕円体を見下ろすほど厚くする
+  let tau = in.prm.z * h.hc2 * h.Lw / r;
+  var alpha = 1.0 - exp(-tau);
+  let dist = length(h.P - O);
+  let c = applyFog(in.col, dist, dot(D, u.sunDir.xyz));
+  if (u.geo2.w > 0.5) {
+    // alpha-to-coverage は MSAA サンプル数に量子化されるので、1 段ぶんの画面ディザで滑らかにする。
+    // 位相 prm.w をインスタンスごとにずらすと、重なった半透明どうしでマスクが相関しない
+    let ign = fract(52.9829189 * fract(0.06711056*in.pos.x + 0.00583715*in.pos.y + in.prm.w));
+    alpha = alpha + (ign - 0.5) * 0.25;
+  }
+  return vec4f(tonemap(c), clamp(alpha, 0.0, 1.0));
+}
+
+// カメラ方向に正対するクアッド。楕円体の正射影の半幅 sqrt(v^T M v) に、
+// 透視でシルエットが中心面より外に出る分の余裕を掛ける。show が 0 なら潰す
+fn impostorQuad(center: vec3f, axis: vec3f, a: f32, r: f32, vi: u32, show: f32) -> vec3f {
+  let toC = center - u.camPos.xyz;
+  let dc = length(toC);
+  let Vc = toC / dc;
+  var Rq = cross(Vc, vec3f(0.0, 1.0, 0.0));
+  Rq = select(normalize(Rq), vec3f(1.0, 0.0, 0.0), dot(Rq, Rq) < 1e-6);
+  let Uq = cross(Rq, Vc);
+  let ra = dot(Rq, axis);
+  let ua = dot(Uq, axis);
+  let hw = sqrt(a*a*ra*ra + r*r*(1.0 - ra*ra));
+  let hh = sqrt(a*a*ua*ua + r*r*(1.0 - ua*ua));
+  let ext = max(a, r);
+  let m = min(dc / sqrt(max(dc*dc - ext*ext, 0.01*ext*ext)), 3.0) * 1.05 * step(1e-4, show);
+  let cx = f32(vi & 1u) * 2.0 - 1.0;
+  let cy = f32(vi >> 1u) * 2.0 - 1.0;
+  return center + Rq * (cx * hw * m) + Uq * (cy * hh * m);
+}
+
+struct EllHit { hit: bool, P: vec3f, hc2: f32, Lw: f32 }  // 手前の交点、単位球での半弦の 2 乗、世界での半弦
+// 楕円体を単位球に写す座標 (軸方向 1/a, 直交方向 1/r) でレイと交差。
+// 交差しない場合も disc を 0 で止めて有限の P を返す: discard されたフラグメントはヘルパーとして
+// 続くので、シルエット際の勾配 (テクスチャの mip 選択) を NaN にしないため
+fn ellipsoidHit(O: vec3f, D: vec3f, C: vec3f, A: vec3f, a: f32, r: f32) -> EllHit {
+  let o = O - C;
   let oa = dot(o, A);
   let da = dot(D, A);
   let op = (o - A*oa) / r + A * (oa / a);
@@ -548,26 +605,241 @@ fn densAt(d: f32) -> f32 { return 1.0 - smoothstep(u.geo.x, u.geo.y, d); }
   let aq = dot(dp, dp);
   let cq = dot(op, op) - 1.0;
   let disc = bq*bq - aq*cq;
-  if (disc <= 0.0) { discard; }
-  let sq = sqrt(disc);
+  let sq = sqrt(max(disc, 0.0));
   let t1 = (-bq + sq) / aq;
-  if (t1 <= 0.0) { discard; }
-  let te = max((-bq - sq) / aq, 0.0);
-  let P = O + D * te;
-  // 密度 (1-s²) の球内線積分は単位球での半弦 hc の 3 乗に比例する。
-  // 1 乗ぶんを世界での半弦 Lw/r に置き換え、軸方向に長い楕円体を見下ろすほど厚くする
-  let hc2 = disc / aq;
-  let Lw = sq / aq;
-  let tau = in.prm.z * hc2 * Lw / r;
-  var alpha = 1.0 - exp(-tau);
-  let dist = length(P - O);
-  let c = applyFog(in.col, dist, dot(D, u.sunDir.xyz));
+  var h: EllHit;
+  h.hit = disc > 0.0 && t1 > 0.0;
+  h.P = O + D * max((-bq - sq) / aq, 0.0);
+  h.hc2 = max(disc, 0.0) / aq;
+  h.Lw = sq / aq;
+  return h;
+}
+
+// --- 草株 (tussock): 回転楕円体インポスターの表面に Ripmap 草の筋を貼る ---
+// 葉は株の中心からウニの針のように放射状に生えているとみなす。殻の各点の針の軸は中心からの
+// 方向で、その像は軸を視線に沿って殻の接平面へ落としたもの (草原の式の地面を接平面に替えた
+// だけ)。筋の方位はその投影から取るので視線で変わり、視線が針に沿う点 (真上から見た頂点、
+// 横から見た正面) では像が潰れて等方タイルの点々になる。タイルは上の極を中心にした方位図法
+// (uv = θ·(cosφ, sinφ)) で天頂から被せて下まで巻き付ける (継ぎ目なし)。
+// 色は 2 層: 単色の葉の殻を暗い芯の上に重ねる。殻の被覆率は詳細密度 d (レイが横切る葉の量) と
+// 殻の見かけ厚み (正面で 1、縁のグレージングで伸びる) から、芯の不透明度は近景ジオメトリ草と
+// 同じ「密度 (1−s²) の球内線積分」(中心で厚く縁で薄い) から取る。正面では殻が薄く芯の暗さが
+// 針の隙間から透け、縁では葉で埋まり d の低い所は背景まで抜ける。筋のコントラストは
+// 葉色 ↔ 芯色/背景 の差から出るので、密度で明るさは変えない。照明の法線は楕円体のもの
+// (stylized な木の葉塊と同じ) で、wrap lighting で影側を持ち上げる
+struct Tussock {
+  base: vec3f, center: vec3f, axis: vec3f,
+  a: f32, r: f32, keep: f32, rho: f32, rnd: f32,
+  wf: vec2f, w: vec2f,
+}
+fn tussockAt(gx: i32, gz: i32) -> Tussock {
+  var T: Tussock;
+  let cell = u.tus3.y;
+  let h0 = hash3f(gx, gz, 7000);
+  let h1 = hash3f(gx, gz, 7001);
+  let h2 = hash3f(gx, gz, 7002);
+  let h3 = hash3f(gx, gz, 7003);
+  let bxz = (vec2f(f32(gx), f32(gz)) + vec2f(h0, h1)) * cell;
+  T.base = vec3f(bxz.x, meshH(bxz), bxz.y);
+  T.rho = textureSampleLevel(rhoTex, samp, rhoUV(bxz), 0.0).r;
+  T.keep = step(h2, u.tus3.z * smoothstep(0.2, 0.6, T.rho));
+  let s = 0.75 + 0.5 * h3;
+  T.r = u.tus.x * s;
+  T.a = u.tus.y * s / (1.0 + u.tus4.w);
+  let N = terrainN(bxz);
+  var axis = normalize(mix(N, vec3f(0.0, 1.0, 0.0), 0.5));
+  T.wf = vec2f(0.0);
+  T.w = vec2f(0.0);
+  if (u.camUp.w > 0.5) {
+    T.wf = windFieldLevel(bxz);
+    T.w = windAt(T.wf);
+    axis += vec3f(T.w.x, 0.0, T.w.y) * 0.25;
+  }
+  T.axis = normalize(axis);
+  T.center = T.base + T.axis * (T.a * u.tus4.w);
+  T.rnd = hash3f(gx, gz, 7004);
+  return T;
+}
+// 軸まわりの方位角の基準となる水平基底
+fn tussockBx(A: vec3f) -> vec3f { return normalize(cross(vec3f(0.0, 0.0, 1.0), A)); }
+// カメラ足元のセルを中心とした n×n グリッドのセル座標
+fn tussockCell(ii: u32, n: u32) -> vec2i {
+  let c0 = vec2i(floor(u.camPos.xz / u.tus3.y)) - vec2i(i32(n / 2u));
+  return c0 + vec2i(i32(ii % n), i32(ii / n));
+}
+// 楕円体法線による照明 (wrap lighting)
+fn tussockLight(n: vec3f, sun: vec3f) -> vec3f {
+  let w = u.tus2.x;
+  let ndl = clamp((dot(n, sun) + w) / (1.0 + w), 0.0, 1.0);
+  return SUN_COL * ndl * 0.9 + SKY_AMB * 0.75;
+}
+
+struct TuOut {
+  @builtin(position) pos: vec4f,
+  @location(0) wp: vec3f,
+  @location(1) center: vec3f,
+  @location(2) axis: vec3f,
+  @location(3) prm: vec4f,   // 半長軸 a, 半径 r, 距離フェード, 乱数 (タイルのオフセットとディザ位相)
+  @location(4) wind: vec4f,  // 風の場 (風向成分, 横成分), 倒す水平ベクトル
+}
+@vertex fn vsTussock(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> TuOut {
+  let c = tussockCell(ii, u32(u.tus3.x));
+  let T = tussockAt(c.x, c.y);
+  let d = distance(T.center, u.camPos.xyz);
+  let fade = (1.0 - smoothstep(u.tus3.w * 0.85, u.tus3.w, d)) * T.keep;
+  let wp = impostorQuad(T.center, T.axis, T.a, T.r, vi, fade);
+  var o: TuOut;
+  o.pos = u.viewProj * vec4f(wp, 1.0);
+  o.wp = wp;
+  o.center = T.center;
+  o.axis = T.axis;
+  o.prm = vec4f(T.a, T.r, fade, T.rnd);
+  o.wind = vec4f(T.wf, T.w);
+  return o;
+}
+
+// 株用の詳細タイル参照 (格子回転なし)。勾配は呼び出し側で与える (非一様な分岐の外で取る)
+fn tussockDetail(duv: vec2f, theta: f32, ddx: vec2f, ddy: vec2f, iso: f32, short: f32) -> f32 {
+  var tm = theta - floor(theta / PI) * PI;
+  var i0 = floor(tm / (PI / ${NDIR}.0));
+  let fw = tm / (PI / ${NDIR}.0) - i0;
+  if (i0 > ${NDIR - 1}.5) { i0 = ${NDIR - 1}.0; }
+  let d = textureSampleGrad(detailArr, sampR, duv, i32(i0), ddx, ddy);
+  var v = mix(mix(d.x, d.y, fw), mix(d.z, d.w, fw), short);
+  if (iso > 0.0) {
+    v = mix(v, textureSampleGrad(detailArr, sampR, duv, ${NDIR}, ddx, ddy).r, iso);
+  }
+  return v;
+}
+struct TuFrag { @location(0) color: vec4f, @builtin(frag_depth) depth: f32 }
+// 深度は楕円体表面。クアッド平面だと裾の手前側が地面に切られる (株は大きく地面と交わるため)
+@fragment fn fsTussock(in: TuOut) -> TuFrag {
+  let O = u.camPos.xyz;
+  let D = normalize(in.wp - O);
+  let A = normalize(in.axis);
+  let a = in.prm.x;
+  let r = in.prm.y;
+  let h = ellipsoidHit(O, D, in.center, A, a, r);
+  // 極座標: phi は軸まわりの方位角、theta は上の極からの角
+  let Bx = tussockBx(A);
+  let Bz = cross(A, Bx);
+  let q = h.P - in.center;
+  let qa = clamp(dot(q, A) / a, -1.0, 1.0);
+  let qh = vec2f(dot(q, Bx), dot(q, Bz)) / r;
+  let rh = length(qh);
+  let phi = atan2(qh.y, qh.x);
+  let theta = atan2(rh, qa);
+  let ct = cos(theta);
+  let st = sin(theta);
+  let radial = Bx * cos(phi) + Bz * sin(phi);
+  let n = normalize(radial * (st / r) + A * (ct / a));
+  // 針の軸 (中心からの方向) を視線に沿って接平面へ落とした像。lh は軸長 1 あたりの像の長さ
+  let sp = normalize(q);
+  var t = sp - D * (dot(sp, n) / min(dot(D, n), -1e-3));
+  let lh = length(t);
+  t = select(t / lh, vec3f(0.0), lh < 1e-5);
+  // 方位図法 uv = sc·θ·(cosφ, sinφ)。接平面の像の向きを uv 空間へ写すには、∂P/∂θ (子午線) と
+  // ∂P/∂φ (緯線、互いに直交) の成分に分けてそれぞれ ∂uv/∂θ, ∂uv/∂φ に掛ける
+  let sc = u.tus5.x / (2.0 * PI);
+  let cp = cos(phi);
+  let spn = sin(phi);
+  let dPth = radial * (r * ct) - A * (a * st);
+  let ePh = vec3f(-Bx.x * spn + Bz.x * cp, -Bx.y * spn + Bz.y * cp, -Bx.z * spn + Bz.z * cp);
+  let alph = dot(t, dPth) / max(dot(dPth, dPth), 1e-8);
+  let beta = dot(t, ePh) / r * (theta / max(st, 1e-4));
+  let tuv = alph * vec2f(cp, spn) + beta * vec2f(-spn, cp);
+  let thetaUV = atan2(tuv.y, tuv.x);
+  let w3 = vec3f(in.wind.z, 0.0, in.wind.w);
+  let windW = vec2f(dot(w3, Bx), dot(w3, Bz)) * 0.09;
+  let off = vec2f(in.prm.w, h11(in.prm.w * 17.0));
+  let uv = (vec2f(cp, spn) * theta - windW / r) * sc + off;
+  let gx = dpdx(uv);
+  let gy = dpdy(uv);
+  // 像が潰れる所は等方タイル (針を真正面から見た点々)、短い所は短いぼかし
+  let isoW = 1.0 - smoothstep(0.0, u.tus5.w, lh);
+  let shortW = 1.0 - smoothstep(${SHORT_RATIO}, 1.0, lh);
+  let det = tussockDetail(uv, thetaUV, gx, gy, isoW, shortW);
+  let detN = det / max(u.par.w, 1e-3);
+  let detB = max(1.0 + (detN - 1.0) * 2.4, 0.05);
+  // 殻: 見かけ厚みは正面で 1、グレージングで 1/|cos| (上限あり)。芯: 弦の長さ。
+  // 縁 (衝突径数 ρ が大きい所) は密度にしきい値を掛け、濃い筋だけを輪郭まで届かせる。
+  // 一様に薄くすると「薄い帯」になるだけで、グレージングの mip 平均 (≈ 平均密度) がそのまま
+  // 均一な殻の縁に見える。しきい値なら平均は超えないので遠景では勝手に消える
+  let g = min(1.0 / max(-dot(D, n), 0.05), u.tus4.z);
+  let rho = sqrt(max(1.0 - h.hc2, 0.0));
+  let thr = u.tusLeaf.w * smoothstep(u.tus5.z, 1.0, rho);
+  let cs = (1.0 - exp(-u.tus.w * max(detB - thr, 0.0) * g)) * in.prm.z;
+  // 芯も同じ窓で消す。弦の長さだけでは縁に薄い暗い輪が残り、殻の輪郭に見える
+  let rimW = 1.0 - smoothstep(u.tus5.z, 1.0, rho);
+  let cc = (1.0 - exp(-u.tus.z * h.hc2 * h.Lw / r)) * rimW * in.prm.z;
+  var alpha = 1.0 - (1.0 - cs) * (1.0 - cc);
+  let sun = u.sunDir.xyz;
+  let light = tussockLight(n, sun);
+  let leaf = u.tusLeaf.rgb * light * windGain(in.wind.xy, D.xz)
+           + TRANS_COL * pow(max(dot(D, sun), 0.0), 6.0) * 0.15;
+  let core = u.tusCore.rgb * light;
+  // 殻を芯の手前に置く (premultiplied の合成を alpha で割って straight に戻す)
+  var c = (leaf * cs + core * ((1.0 - cs) * cc)) / max(alpha, 1e-4);
+  let dist = length(h.P - O);
+  c = applyFog(c, dist, dot(D, sun));
   if (u.geo2.w > 0.5) {
-    // alpha-to-coverage は MSAA サンプル数に量子化されるので、1 段ぶんの画面ディザで滑らかにする
-    let ign = fract(52.9829189 * fract(0.06711056*in.pos.x + 0.00583715*in.pos.y));
+    let ign = fract(52.9829189 * fract(0.06711056*in.pos.x + 0.00583715*in.pos.y + in.prm.w));
     alpha = alpha + (ign - 0.5) * 0.25;
   }
-  return vec4f(tonemap(c), clamp(alpha, 0.0, 1.0));
+  if (!h.hit) { discard; }
+  let clip = u.viewProj * vec4f(h.P, 1.0);
+  var o: TuFrag;
+  o.color = vec4f(tonemap(c), clamp(alpha, 0.0, 1.0));
+  if (u.tus5.y > 0.5) {
+    let uvg = uv * 16.0;
+    let grid = step(0.5, fract(uvg.x)) + step(0.5, fract(uvg.y));
+    var dc = vec3f(detN * 0.5);
+    if (u.tus5.y > 1.5) { dc = vec3f(select(0.2, 0.8, grid == 1.0)); }
+    if (u.tus5.y > 2.5) { dc = vec3f(min(lh, 1.0), isoW, shortW); }
+    if (u.tus5.y > 3.5) { dc = vec3f(cs, cc, 0.0); }
+    o.color = vec4f(dc, 1.0);
+  }
+  o.depth = clip.z / clip.w;
+  return o;
+}
+
+// 近景: 中心から放射状のブレード (細長い楕円体インポスター) を殻の位置に重ねる。描画は fsGrass
+@vertex fn vsTussockBlade(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> GOut {
+  let nb = u32(u.tus2.y);
+  let c = tussockCell(ii / nb, u32(u.tus4.x));
+  let k = i32(ii % nb);
+  let T = tussockAt(c.x, c.y);
+  let h0 = hash3f(c.x, c.y, 8000 + k);
+  let h1 = hash3f(c.x, c.y, 9000 + k);
+  let h2 = hash3f(c.x, c.y, 10000 + k);
+  let h3 = hash3f(c.x, c.y, 11000 + k);
+  let phi = h0 * 2.0 * PI;
+  // 上半球に一様 (cosθ 一様)
+  let ct = mix(1.0, 0.1, h1);
+  let st = sqrt(1.0 - ct * ct);
+  let Bx = tussockBx(T.axis);
+  let Bz = cross(T.axis, Bx);
+  let radial = Bx * cos(phi) + Bz * sin(phi);
+  let surf = radial * (T.r * st) + T.axis * (T.a * ct);
+  let axis = normalize(surf);
+  let center = T.center + surf;
+  let a = u.tus2.z * 0.5 * (0.7 + 0.6 * h2);
+  let r = u.tus2.w * 0.5 * (0.7 + 0.6 * h3);
+  let d = distance(center, u.camPos.xyz);
+  let fade = (1.0 - smoothstep(u.tus4.y * 0.6, u.tus4.y, d)) * T.keep;
+  let wp = impostorQuad(center, axis, a, r, vi, fade);
+  var o: GOut;
+  o.pos = u.viewProj * vec4f(wp, 1.0);
+  o.wp = wp;
+  o.center = center;
+  o.axis = axis;
+  o.prm = vec4f(a, r, u.geo.w * fade, h0);
+  let Vc = normalize(center - u.camPos.xyz);
+  let sun = u.sunDir.xyz;
+  let n = normalize(radial * (st / T.r) + T.axis * (ct / T.a));
+  o.col = u.tusLeaf.rgb * tussockLight(n, sun) * windGain(T.wf, Vc.xz)
+        + TRANS_COL * pow(max(dot(Vc, sun), 0.0), 6.0) * 0.15;
+  return o;
 }
 
 // --- 方向ぼかし詳細テクスチャのビューア (赤線が各層のぼかし方向) ---
@@ -862,7 +1134,7 @@ async function main() {
       { binding: 7, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, sampler: {} },
     ],
   });
-  const uBuf = device.createBuffer({ size: 224, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const uBuf = device.createBuffer({ size: 336, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const chunkBuf = device.createBuffer({ size: G_MAX_CHUNKS * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
   const chunkData = new Float32Array(G_MAX_CHUNKS * 4);
   const bindA = device.createBindGroup({
@@ -906,6 +1178,22 @@ async function main() {
     depthStencil: depthOn,
     multisample: { count: MSAA, alphaToCoverageEnabled: true },
   });
+  const tussockPipe = device.createRenderPipeline({
+    layout: pLayoutA,
+    vertex: { module: sceneMod, entryPoint: 'vsTussock' },
+    fragment: { module: sceneMod, entryPoint: 'fsTussock', targets },
+    primitive: { topology: 'triangle-strip', cullMode: 'none' },
+    depthStencil: depthOn,
+    multisample: { count: MSAA, alphaToCoverageEnabled: true },
+  });
+  const tussockBladePipe = device.createRenderPipeline({
+    layout: pLayoutA,
+    vertex: { module: sceneMod, entryPoint: 'vsTussockBlade' },
+    fragment: { module: sceneMod, entryPoint: 'fsGrass', targets },
+    primitive: { topology: 'triangle-strip', cullMode: 'none' },
+    depthStencil: depthOn,
+    multisample: { count: MSAA, alphaToCoverageEnabled: true },
+  });
   const overlayPipe = device.createRenderPipeline({
     layout: pLayoutA,
     vertex: { module: sceneMod, entryPoint: 'vsOverlay' },
@@ -941,6 +1229,7 @@ async function main() {
     geomOn: true, bpc: 4, gRadius: 25, gSoft: 0.6, gSigma: 3.0, gDens: 1.0, dither: true,
     gHeight: parseFloat(q.get('gh') || '0.5'), gWidth: parseFloat(q.get('gw') || '0.1'),
     lMin: parseFloat(q.get('lmin') || '1.0'),
+    tussockOn: true, tBladesOn: false, tKc: T_P.kc, tKs: T_P.ks,
     time: 0, fps: 0,
   };
   state.pos[1] = terrainHJS(0, 240) + 1.7;
@@ -996,6 +1285,12 @@ async function main() {
     if (k === 'j') state.gHeight = Math.min(5, state.gHeight * 1.15);
     if (k === 'k') state.gWidth = Math.max(0.005, state.gWidth / 1.15);
     if (k === 'l') state.gWidth = Math.min(1, state.gWidth * 1.15);
+    if (k === 'u') state.tussockOn = !state.tussockOn;
+    if (k === 'y') state.tBladesOn = !state.tBladesOn;
+    if (k === ';') state.tKc = Math.max(0.1, state.tKc / 1.3);
+    if (k === "'") state.tKc = Math.min(50, state.tKc * 1.3);
+    if (k === 'q') state.tKs = Math.max(0.05, state.tKs / 1.3);
+    if (k === 'e') state.tKs = Math.min(20, state.tKs * 1.3);
   });
   window.addEventListener('keyup', e => state.keys.delete(e.key.toLowerCase()));
 
@@ -1037,7 +1332,9 @@ async function main() {
   };
 
   // --- frame loop ---
-  const uData = new Float32Array(56);
+  const uData = new Float32Array(84);
+  const tN = Math.ceil(2 * T_P.R / T_P.cell);
+  const tBN = Math.ceil(2 * T_P.br / T_P.cell);
 
   // チャンク AABB の 8 頂点が同じクリップ平面の外側に揃ったら不可視
   function chunkVisible(vp, ox, oz, y0, y1) {
@@ -1158,6 +1455,13 @@ async function main() {
     uData.set([state.gRadius * (1 - state.gSoft), state.gRadius, state.bpc, state.gSigma], 44);
     uData.set([state.gHeight, state.gWidth, state.gDens, state.dither ? 1 : 0], 48);
     uData.set([state.windBend, state.windDark, (state.time * state.windSpeed / wind.tile) % 1, wind.tile], 52);
+    uData.set([T_P.r, T_P.h, state.tKc, state.tKs], 56);
+    uData.set([T_P.wrap, T_P.nb, T_P.bl, T_P.bw], 60);
+    uData.set([tN, T_P.cell, T_P.prob, T_P.R], 64);
+    uData.set([tBN, T_P.br, T_P.lmax, T_P.cf], 68);
+    uData.set([T_P.k, T_P.debug, T_P.rim0, T_P.iso], 72);
+    uData.set([...T_P.leaf, T_P.rimT], 76);
+    uData.set([...T_P.core, 0], 80);
     device.queue.writeBuffer(uBuf, 0, uData);
     const chunksInfo = state.geomOn ? collectChunks(viewProj, pos) : { draws: [], n: 0, blades: 0 };
     if (chunksInfo.n > 0) device.queue.writeBuffer(chunkBuf, 0, chunkData, 0, chunksInfo.n * 4);
@@ -1178,6 +1482,14 @@ async function main() {
     pass.setPipeline(terrainPipe);
     pass.setIndexBuffer(terIdxBuf, 'uint32');
     pass.drawIndexed(terIdx.length);
+    if (state.tussockOn) {
+      pass.setPipeline(tussockPipe);
+      pass.draw(4, tN * tN);
+      if (state.tBladesOn) {
+        pass.setPipeline(tussockBladePipe);
+        pass.draw(4, tBN * tBN * T_P.nb);
+      }
+    }
     if (chunksInfo.draws.length) {
       pass.setPipeline(grassPipe);
       for (const [inst, slot] of chunksInfo.draws) pass.draw(4, inst, 0, slot * G_MAX_INST);
@@ -1199,6 +1511,8 @@ async function main() {
       `geom[G] ${state.geomOn ? 'on' : 'off'}  blades ${(chunksInfo.blades / 1000).toFixed(0)}k / ${chunksInfo.n} chunks  ` +
       `bpc[3/4] ${state.bpc}  radius[5/6] ${state.gRadius.toFixed(0)}m  soft[,/.] ${state.gSoft.toFixed(2)}  sigma[9/0] ${state.gSigma.toFixed(1)}  dither[X] ${state.dither ? 'on' : 'off'}\n` +
       `height[H/J] ${(state.gHeight * 100).toFixed(0)}cm  width[K/L] ${(state.gWidth * 100).toFixed(1)}cm  shade-dens[[/]] ${state.gDens.toFixed(2)}\n` +
+      `tussock[U] ${state.tussockOn ? 'on' : 'off'}  r ${T_P.r}m h ${T_P.h}m cell ${T_P.cell}m prob ${T_P.prob} R ${T_P.R}m  core-k[;/'] ${state.tKc.toFixed(2)}  shell-k[Q/E] ${state.tKs.toFixed(2)}  ` +
+      `lmax ${T_P.lmax} rim ${T_P.rim0}/${T_P.rimT} wrap ${T_P.wrap} k ${T_P.k} iso ${T_P.iso}  blades[Y] ${state.tBladesOn ? 'on' : 'off'} ×${T_P.nb} len ${T_P.bl}m w ${T_P.bw}m R ${T_P.br}m\n` +
       `drag:look  WASD:move  R/F:up/down  Shift:fast  P:pause`;
   }
   function frameWrap(now) {
