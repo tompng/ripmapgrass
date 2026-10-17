@@ -44,8 +44,8 @@ const G_CF = parseFloat(q.get('gcf') || '0.75');
 // 草株 (tussock) の実験ノブ。URL パラメータで上書き
 const tq = (name, def) => parseFloat(q.get(name) ?? def);
 const T_P = {
-  r: tq('tr', 0.55),       // 半径 [m]
-  h: tq('th', 0.6),        // 地面からの高さ [m]
+  r: tq('tr', 1),          // 半径 [m]
+  h: tq('th', 2),          // 地面からの高さ [m]
   cf: tq('tcf', 0.3),      // 楕円体中心の高さ (半長軸比)。残りは地中
   cell: tq('tcell', 4),    // 配置セル [m]
   prob: tq('tprob', 0.6),  // セルあたりの出現確率 (マクロ密度で変調)
@@ -53,12 +53,13 @@ const T_P = {
   kc: tq('tkc', 3),        // 芯 (暗い塊) の光学的厚さ。弦が直径のとき 1−exp(−kc)
   ks: tq('tks', 0.7),      // 葉の殻の光学的厚さ。正面で密度 1 のとき 1−exp(−ks)
   lmax: tq('tlmax', 1),    // 殻の見かけ厚みの上限 (正面を 1 として、縁のグレージングで伸びる分)
+  org: tq('torg', -1),     // 針が生える原点の高さ [m] (根元 = 地面を 0 とし、軸に沿って測る。負で地中)
   rim0: tq('trim0', 0.6),  // 縁のしきい値が立ち上がる衝突径数 ρ (正射影の円板での中心からの距離)
   rimT: tq('trimt', 2.0),  // 輪郭 (ρ = 1) での密度しきい値 (平均 1、筋のピーク ~2.4)
   wrap: tq('twrap', 0.5),  // 楕円体法線の wrap lighting 量 (影側を持ち上げる)
   leaf: (q.get('tleaf') || '0.46,0.46,0.17').split(',').map(Number),  // 葉の色 (単色、草原と別種のオリーブ)
   core: (q.get('tcore') || '0.08,0.06,0.03').split(',').map(Number),  // 芯の色
-  k: tq('tk', 3),          // 方位図法の倍率 (赤道 1 周ぶんの弧に貼るタイル数)
+  k: tq('tk', 1.5),        // 方位図法の倍率 (赤道 1 周ぶんの弧に貼るタイル数)
   iso: tq('tiso', 0.25),   // 等方タイル (針を真正面から見た点々) へ混ぜる像の長さの上限
   nb: tq('tnb', 24),       // 株あたりのブレード数
   bl: tq('tbl', 0.35),     // ブレード長 [m]
@@ -272,7 +273,7 @@ struct U {
   tus4: vec4f,      // ブレードグリッドの一辺のセル数, ブレード描画半径, 殻の見かけ厚みの上限, 中心の高さ (半長軸比)
   tus5: vec4f,      // 方位図法の倍率, デバッグ表示, 縁のしきい値が立ち上がる ρ, 等方へ混ぜる像の長さの上限
   tusLeaf: vec4f,   // 葉の色, 輪郭での密度しきい値
-  tusCore: vec4f,   // 芯の色, -
+  tusCore: vec4f,   // 芯の色, 針の原点の高さ (根元から軸に沿って)
 }
 fn rhoUV(p: vec2f) -> vec2f {
   return (p - vec2f(${REG_MIN}.0)) / ${REG_SPAN}.0;
@@ -616,9 +617,9 @@ fn ellipsoidHit(O: vec3f, D: vec3f, C: vec3f, A: vec3f, a: f32, r: f32) -> EllHi
 }
 
 // --- 草株 (tussock): 回転楕円体インポスターの表面に Ripmap 草の筋を貼る ---
-// 葉は株の中心からウニの針のように放射状に生えているとみなす。殻の各点の針の軸は中心からの
-// 方向で、その像は軸を視線に沿って殻の接平面へ落としたもの (草原の式の地面を接平面に替えた
-// だけ)。筋の方位はその投影から取るので視線で変わり、視線が針に沿う点 (真上から見た頂点、
+// 葉は 1 点 (原点。既定は根元で、株の中心にするとウニ) から放射状に生えているとみなす。殻の各点の
+// 針の軸は原点からの方向で、その像は軸を視線に沿って殻の接平面へ落としたもの (草原の式の地面を
+// 接平面に替えただけ)。筋の方位はその投影から取るので視線で変わり、視線が針に沿う点 (真上から見た頂点、
 // 横から見た正面) では像が潰れて等方タイルの点々になる。タイルは上の極を中心にした方位図法
 // (uv = θ·(cosφ, sinφ)) で天頂から被せて下まで巻き付ける (継ぎ目なし)。
 // 色は 2 層: 単色の葉の殻を暗い芯の上に重ねる。殻の被覆率は詳細密度 d (レイが横切る葉の量) と
@@ -681,6 +682,7 @@ struct TuOut {
   @location(2) axis: vec3f,
   @location(3) prm: vec4f,   // 半長軸 a, 半径 r, 距離フェード, 乱数 (タイルのオフセットとディザ位相)
   @location(4) wind: vec4f,  // 風の場 (風向成分, 横成分), 倒す水平ベクトル
+  @location(5) origin: vec3f,
 }
 @vertex fn vsTussock(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> TuOut {
   let c = tussockCell(ii, u32(u.tus3.x));
@@ -695,6 +697,7 @@ struct TuOut {
   o.axis = T.axis;
   o.prm = vec4f(T.a, T.r, fade, T.rnd);
   o.wind = vec4f(T.wf, T.w);
+  o.origin = T.base + T.axis * u.tusCore.w;
   return o;
 }
 
@@ -733,8 +736,8 @@ struct TuFrag { @location(0) color: vec4f, @builtin(frag_depth) depth: f32 }
   let st = sin(theta);
   let radial = Bx * cos(phi) + Bz * sin(phi);
   let n = normalize(radial * (st / r) + A * (ct / a));
-  // 針の軸 (中心からの方向) を視線に沿って接平面へ落とした像。lh は軸長 1 あたりの像の長さ
-  let sp = normalize(q);
+  // 針の軸 (原点からの方向) を視線に沿って接平面へ落とした像。lh は軸長 1 あたりの像の長さ
+  let sp = normalize(h.P - in.origin);
   var t = sp - D * (dot(sp, n) / min(dot(D, n), -1e-3));
   let lh = length(t);
   t = select(t / lh, vec3f(0.0), lh < 1e-5);
@@ -803,7 +806,7 @@ struct TuFrag { @location(0) color: vec4f, @builtin(frag_depth) depth: f32 }
   return o;
 }
 
-// 近景: 中心から放射状のブレード (細長い楕円体インポスター) を殻の位置に重ねる。描画は fsGrass
+// 近景: 原点から放射状のブレード (細長い楕円体インポスター) を殻の位置に重ねる。描画は fsGrass
 @vertex fn vsTussockBlade(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> GOut {
   let nb = u32(u.tus2.y);
   let c = tussockCell(ii / nb, u32(u.tus4.x));
@@ -820,9 +823,8 @@ struct TuFrag { @location(0) color: vec4f, @builtin(frag_depth) depth: f32 }
   let Bx = tussockBx(T.axis);
   let Bz = cross(T.axis, Bx);
   let radial = Bx * cos(phi) + Bz * sin(phi);
-  let surf = radial * (T.r * st) + T.axis * (T.a * ct);
-  let axis = normalize(surf);
-  let center = T.center + surf;
+  let center = T.center + radial * (T.r * st) + T.axis * (T.a * ct);
+  let axis = normalize(center - (T.base + T.axis * u.tusCore.w));
   let a = u.tus2.z * 0.5 * (0.7 + 0.6 * h2);
   let r = u.tus2.w * 0.5 * (0.7 + 0.6 * h3);
   let d = distance(center, u.camPos.xyz);
@@ -1461,7 +1463,7 @@ async function main() {
     uData.set([tBN, T_P.br, T_P.lmax, T_P.cf], 68);
     uData.set([T_P.k, T_P.debug, T_P.rim0, T_P.iso], 72);
     uData.set([...T_P.leaf, T_P.rimT], 76);
-    uData.set([...T_P.core, 0], 80);
+    uData.set([...T_P.core, T_P.org], 80);
     device.queue.writeBuffer(uBuf, 0, uData);
     const chunksInfo = state.geomOn ? collectChunks(viewProj, pos) : { draws: [], n: 0, blades: 0 };
     if (chunksInfo.n > 0) device.queue.writeBuffer(chunkBuf, 0, chunkData, 0, chunksInfo.n * 4);
@@ -1512,7 +1514,7 @@ async function main() {
       `bpc[3/4] ${state.bpc}  radius[5/6] ${state.gRadius.toFixed(0)}m  soft[,/.] ${state.gSoft.toFixed(2)}  sigma[9/0] ${state.gSigma.toFixed(1)}  dither[X] ${state.dither ? 'on' : 'off'}\n` +
       `height[H/J] ${(state.gHeight * 100).toFixed(0)}cm  width[K/L] ${(state.gWidth * 100).toFixed(1)}cm  shade-dens[[/]] ${state.gDens.toFixed(2)}\n` +
       `tussock[U] ${state.tussockOn ? 'on' : 'off'}  r ${T_P.r}m h ${T_P.h}m cell ${T_P.cell}m prob ${T_P.prob} R ${T_P.R}m  core-k[;/'] ${state.tKc.toFixed(2)}  shell-k[Q/E] ${state.tKs.toFixed(2)}  ` +
-      `lmax ${T_P.lmax} rim ${T_P.rim0}/${T_P.rimT} wrap ${T_P.wrap} k ${T_P.k} iso ${T_P.iso}  blades[Y] ${state.tBladesOn ? 'on' : 'off'} ×${T_P.nb} len ${T_P.bl}m w ${T_P.bw}m R ${T_P.br}m\n` +
+      `org ${T_P.org}m lmax ${T_P.lmax} rim ${T_P.rim0}/${T_P.rimT} wrap ${T_P.wrap} k ${T_P.k} iso ${T_P.iso}  blades[Y] ${state.tBladesOn ? 'on' : 'off'} ×${T_P.nb} len ${T_P.bl}m w ${T_P.bw}m R ${T_P.br}m\n` +
       `drag:look  WASD:move  R/F:up/down  Shift:fast  P:pause`;
   }
   function frameWrap(now) {
