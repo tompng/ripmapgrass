@@ -54,6 +54,7 @@ const T_P = {
   ks: tq('tks', 0.7),      // 葉の殻の光学的厚さ。正面で密度 1 のとき 1−exp(−ks)
   lmax: tq('tlmax', 1),    // 殻の見かけ厚みの上限 (正面を 1 として、縁のグレージングで伸びる分)
   org: tq('torg', -1),     // 針が生える原点の高さ [m] (根元 = 地面を 0 とし、軸に沿って測る。負で地中)
+  bend: tq('tbend', 0.2),  // 風で倒す量 (突風 1 のとき、株の高さに対する先端の変位の比)
   rim0: tq('trim0', 0.6),  // 縁のしきい値が立ち上がる衝突径数 ρ (正射影の円板での中心からの距離)
   rimT: tq('trimt', 2.0),  // 輪郭 (ρ = 1) での密度しきい値 (平均 1、筋のピーク ~2.4)
   wrap: tq('twrap', 0.5),  // 楕円体法線の wrap lighting 量 (影側を持ち上げる)
@@ -67,6 +68,11 @@ const T_P = {
   br: tq('tbr', 30),       // ブレード描画半径 [m]
   debug: tq('tdebug', 0),  // 1: 詳細密度, 2: 表面 uv の格子, 3: 像の長さ (R) / 等方 (G) / 短 (B) の重み
 };
+
+// 株メッシュ: 緯度経度の半球 + 裾。遠景は粗いメッシュ、近景 (ブレードと同じ内側グリッド) は細かいメッシュ
+const T_SEG_F = 24, T_RING_F = 12, T_SEG_C = 12, T_RING_C = 6;
+const T_THETA_MAX = 2.0;
+const T_LOD_BASE = 1 << 20;
 
 const hud = document.getElementById('hud');
 const canvas = document.getElementById('c');
@@ -274,6 +280,7 @@ struct U {
   tus5: vec4f,      // 方位図法の倍率, デバッグ表示, 縁のしきい値が立ち上がる ρ, 等方へ混ぜる像の長さの上限
   tusLeaf: vec4f,   // 葉の色, 輪郭での密度しきい値
   tusCore: vec4f,   // 芯の色, 針の原点の高さ (根元から軸に沿って)
+  tus6: vec4f,      // 風で倒す量, -, -, -
 }
 fn rhoUV(p: vec2f) -> vec2f {
   return (p - vec2f(${REG_MIN}.0)) / ${REG_SPAN}.0;
@@ -654,13 +661,27 @@ fn tussockAt(gx: i32, gz: i32) -> Tussock {
   if (u.camUp.w > 0.5) {
     T.wf = windFieldLevel(bxz);
     T.w = windAt(T.wf);
-    axis += vec3f(T.w.x, 0.0, T.w.y) * 0.25;
   }
   T.axis = normalize(axis);
   T.center = T.base + T.axis * (T.a * u.tus4.w);
   T.rnd = hash3f(gx, gz, 7004);
   return T;
 }
+// 風の変形 D(x) = x + κ·max(y − y₀, 0)²·ŵ (y は軸に沿った高さ)。y を変えないので逆写像が閉じる。
+// 支点 y₀ は原点・楕円体の下端・地面の最大 (地中に置くと地面の輪が横滑りする)。
+// κ は先端 (高さ h) の変位が bend·|w|·h になるように取る
+struct Bend { w: vec3f, kappa: f32, y0: f32 }  // ŵ (単位、|w| は kappa に込み)
+fn tussockBend(T: Tussock) -> Bend {
+  var b: Bend;
+  let mag = length(T.w);
+  b.w = select(vec3f(1.0, 0.0, 0.0), vec3f(T.w.x, 0.0, T.w.y) / max(mag, 1e-6), mag > 1e-6);
+  let yTop = T.a * (1.0 + u.tus4.w);
+  b.y0 = max(max(u.tusCore.w, -T.a * (1.0 - u.tus4.w)), 0.0);
+  b.kappa = u.tus6.x * mag * yTop / max((yTop - b.y0) * (yTop - b.y0), 1e-4);
+  return b;
+}
+fn bendDisp(b: Bend, y: f32) -> f32 { return b.kappa * max(y - b.y0, 0.0) * max(y - b.y0, 0.0); }
+fn bendSlope(b: Bend, y: f32) -> f32 { return 2.0 * b.kappa * max(y - b.y0, 0.0); }
 // 軸まわりの方位角の基準となる水平基底
 fn tussockBx(A: vec3f) -> vec3f { return normalize(cross(vec3f(0.0, 0.0, 1.0), A)); }
 // カメラ足元のセルを中心とした n×n グリッドのセル座標
@@ -677,27 +698,66 @@ fn tussockLight(n: vec3f, sun: vec3f) -> vec3f {
 
 struct TuOut {
   @builtin(position) pos: vec4f,
-  @location(0) wp: vec3f,
-  @location(1) center: vec3f,
-  @location(2) axis: vec3f,
-  @location(3) prm: vec4f,   // 半長軸 a, 半径 r, 距離フェード, 乱数 (タイルのオフセットとディザ位相)
-  @location(4) wind: vec4f,  // 風の場 (風向成分, 横成分), 倒す水平ベクトル
-  @location(5) origin: vec3f,
+  @location(0) wp: vec3f,     // 変形後の位置
+  @location(1) sph: vec3f,    // 変形前の面上の点 (単位球座標: 軸方向 /a、直交方向 /r)
+  @location(2) center: vec3f,
+  @location(3) axis: vec3f,
+  @location(4) prm: vec4f,    // 半長軸 a, 半径 r, 距離フェード, 乱数 (タイルのオフセットとディザ位相)
+  @location(5) wind: vec4f,   // 風の場 (風向成分, 横成分), 変形の ŵ.xz
+  @location(6) origin: vec3f,
+  @location(7) bend: vec2f,   // κ, y₀
 }
+// 株のメッシュは緯度経度の半球 + 裾 (極角 0 〜 ${T_THETA_MAX} rad) で、頂点は添字から生成する。
+// 近景 (内側 m×m セル、firstInstance = ${T_LOD_BASE}) は ${T_SEG_F}×${T_RING_F}、遠景は ${T_SEG_C}×${T_RING_C}
+const T_LOD_BASE = ${T_LOD_BASE}u;
 @vertex fn vsTussock(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> TuOut {
-  let c = tussockCell(ii, u32(u.tus3.x));
+  let fine = ii >= T_LOD_BASE;
+  let inst = select(ii, ii - T_LOD_BASE, fine);
+  let nFine = u32(u.tus4.x);
+  let nAll = u32(u.tus3.x);
+  var c: vec2i;
+  var show = 1.0;
+  if (fine) {
+    c = tussockCell(inst, nFine);
+  } else {
+    c = tussockCell(inst, nAll);
+    let cf = tussockCell(0u, nFine);
+    let d = c - cf;
+    if (d.x >= 0 && d.y >= 0 && d.x < i32(nFine) && d.y < i32(nFine)) { show = 0.0; }
+  }
+  let seg = select(${T_SEG_C}u, ${T_SEG_F}u, fine);
+  let ring = select(${T_RING_C}u, ${T_RING_F}u, fine);
+  let tri = vi / 3u;
+  let corner = vi % 3u;
+  let quad = tri / 2u;
+  let i = quad / seg;
+  let j = quad % seg;
+  // 四角形 (i,j) の 2 三角形: (i,j)(i+1,j)(i,j+1) と (i+1,j)(i+1,j+1)(i,j+1)
+  let odd = tri % 2u;
+  let di = select(select(0u, 1u, corner == 1u), select(1u, 0u, corner == 2u), odd == 1u);
+  let dj = select(select(0u, 1u, corner == 2u), select(0u, 1u, corner >= 1u), odd == 1u);
+  let theta = f32(i + di) / f32(ring) * ${T_THETA_MAX};
+  let phi = f32((j + dj) % seg) / f32(seg) * 2.0 * PI;
   let T = tussockAt(c.x, c.y);
   let d = distance(T.center, u.camPos.xyz);
-  let fade = (1.0 - smoothstep(u.tus3.w * 0.85, u.tus3.w, d)) * T.keep;
-  let wp = impostorQuad(T.center, T.axis, T.a, T.r, vi, fade);
+  let fade = (1.0 - smoothstep(u.tus3.w * 0.85, u.tus3.w, d)) * T.keep * show;
+  let Bx = tussockBx(T.axis);
+  let Bz = cross(T.axis, Bx);
+  let sph = vec3f(sin(theta) * cos(phi), cos(theta), sin(theta) * sin(phi));
+  let p0 = T.center + Bx * (T.r * sph.x) + T.axis * (T.a * sph.y) + Bz * (T.r * sph.z);
+  let b = tussockBend(T);
+  let y = dot(p0 - T.base, T.axis);
+  let wp = p0 + b.w * bendDisp(b, y);
   var o: TuOut;
-  o.pos = u.viewProj * vec4f(wp, 1.0);
+  o.pos = select(vec4f(0.0, 0.0, 2.0, 1.0), u.viewProj * vec4f(wp, 1.0), fade > 1e-4);
   o.wp = wp;
+  o.sph = sph;
   o.center = T.center;
   o.axis = T.axis;
   o.prm = vec4f(T.a, T.r, fade, T.rnd);
-  o.wind = vec4f(T.wf, T.w);
+  o.wind = vec4f(T.wf, b.w.xz);
   o.origin = T.base + T.axis * u.tusCore.w;
+  o.bend = vec2f(b.kappa, b.y0);
   return o;
 }
 
@@ -714,50 +774,50 @@ fn tussockDetail(duv: vec2f, theta: f32, ddx: vec2f, ddy: vec2f, iso: f32, short
   }
   return v;
 }
-struct TuFrag { @location(0) color: vec4f, @builtin(frag_depth) depth: f32 }
-// 深度は楕円体表面。クアッド平面だと裾の手前側が地面に切られる (株は大きく地面と交わるため)
-@fragment fn fsTussock(in: TuOut) -> TuFrag {
+
+@fragment fn fsTussock(in: TuOut) -> @location(0) vec4f {
   let O = u.camPos.xyz;
   let D = normalize(in.wp - O);
   let A = normalize(in.axis);
   let a = in.prm.x;
   let r = in.prm.y;
-  let h = ellipsoidHit(O, D, in.center, A, a, r);
-  // 極座標: phi は軸まわりの方位角、theta は上の極からの角
   let Bx = tussockBx(A);
   let Bz = cross(A, Bx);
-  let q = h.P - in.center;
-  let qa = clamp(dot(q, A) / a, -1.0, 1.0);
-  let qh = vec2f(dot(q, Bx), dot(q, Bz)) / r;
-  let rh = length(qh);
-  let phi = atan2(qh.y, qh.x);
-  let theta = atan2(rh, qa);
-  let ct = cos(theta);
-  let st = sin(theta);
-  let radial = Bx * cos(phi) + Bz * sin(phi);
-  let n = normalize(radial * (st / r) + A * (ct / a));
-  // 針の軸 (原点からの方向) を視線に沿って接平面へ落とした像。lh は軸長 1 あたりの像の長さ
-  let sp = normalize(h.P - in.origin);
-  var t = sp - D * (dot(sp, n) / min(dot(D, n), -1e-3));
-  let lh = length(t);
-  t = select(t / lh, vec3f(0.0), lh < 1e-5);
-  // 方位図法 uv = sc·θ·(cosφ, sinφ)。接平面の像の向きを uv 空間へ写すには、∂P/∂θ (子午線) と
-  // ∂P/∂φ (緯線、互いに直交) の成分に分けてそれぞれ ∂uv/∂θ, ∂uv/∂φ に掛ける
-  let sc = u.tus5.x / (2.0 * PI);
-  let cp = cos(phi);
-  let spn = sin(phi);
-  let dPth = radial * (r * ct) - A * (a * st);
-  let ePh = vec3f(-Bx.x * spn + Bz.x * cp, -Bx.y * spn + Bz.y * cp, -Bx.z * spn + Bz.z * cp);
-  let alph = dot(t, dPth) / max(dot(dPth, dPth), 1e-8);
-  let beta = dot(t, ePh) / r * (theta / max(st, 1e-4));
-  let tuv = alph * vec2f(cp, spn) + beta * vec2f(-spn, cp);
-  let thetaUV = atan2(tuv.y, tuv.x);
+  let sph = normalize(in.sph);
+  let p0 = in.center + Bx * (r * sph.x) + A * (a * sph.y) + Bz * (r * sph.z);
+  // 弦: 変形前の面上の点と視線を単位球座標に写すと、半弦は dot(sph, ds)/|ds|² で閉じる。
+  // dot > 0 は裏面 (視線が出ていく側) なので捨てる
+  let ds = vec3f(dot(D, Bx) / r, dot(D, A) / a, dot(D, Bz) / r);
+  let pd = dot(sph, ds);
+  let ds2 = dot(ds, ds);
+  let hc2 = pd * pd / ds2;
+  let Lw = abs(pd) / ds2;
+  let rho = sqrt(max(1.0 - hc2, 0.0));
+  // 変形 J = I + f'(y)·ŵ ⊗ Aᵀ。葉の接線は J·s₀、法線は J⁻ᵀ n₀
   let w3 = vec3f(in.wind.z, 0.0, in.wind.w);
-  let windW = vec2f(dot(w3, Bx), dot(w3, Bz)) * 0.09;
+  let y = dot(p0 - (in.center - A * (a * u.tus4.w)), A);
+  let fp = 2.0 * in.bend.x * max(y - in.bend.y, 0.0);
+  let n0 = normalize(Bx * (sph.x / r) + A * (sph.y / a) + Bz * (sph.z / r));
+  let n = normalize(n0 - A * (fp * dot(w3, n0)));
+  let s0 = normalize(p0 - in.origin);
+  let t = normalize(s0 + w3 * (fp * dot(s0, A)));
+  let lh = sqrt(max(1.0 - dot(t, D) * dot(t, D), 0.0));
+  // 方位図法 uv = sc·θ·(cosφ, sinφ)。筋の向きは、接線を画面に投影した方向を uv の画面微分で
+  // uv 空間へ写して得る (画面への投影が「視線に沿って接平面へ落とす」ことに当たるので、
+  // 変形や楕円体のヤコビアンは要らない)
+  let sc = u.tus5.x / (2.0 * PI);
+  let theta = acos(clamp(sph.y, -1.0, 1.0));
+  let phi = atan2(sph.z, sph.x);
   let off = vec2f(in.prm.w, h11(in.prm.w * 17.0));
-  let uv = (vec2f(cp, spn) * theta - windW / r) * sc + off;
+  let uv = vec2f(cos(phi), sin(phi)) * (theta * sc) + off;
   let gx = dpdx(uv);
   let gy = dpdy(uv);
+  let clip = u.viewProj * vec4f(in.wp, 1.0);
+  let clipT = u.viewProj * vec4f(t, 0.0);
+  let sdir = (clipT.xy - clip.xy * (clipT.w / clip.w)) / clip.w;
+  // NDC → 画素: x はアスペクト倍、y は上下反転
+  let tuv = gx * (sdir.x * u.camRight.w) - gy * sdir.y;
+  let thetaUV = atan2(tuv.y, tuv.x);
   // 像が潰れる所は等方タイル (針を真正面から見た点々)、短い所は短いぼかし
   let isoW = 1.0 - smoothstep(0.0, u.tus5.w, lh);
   let shortW = 1.0 - smoothstep(${SHORT_RATIO}, 1.0, lh);
@@ -769,12 +829,11 @@ struct TuFrag { @location(0) color: vec4f, @builtin(frag_depth) depth: f32 }
   // 一様に薄くすると「薄い帯」になるだけで、グレージングの mip 平均 (≈ 平均密度) がそのまま
   // 均一な殻の縁に見える。しきい値なら平均は超えないので遠景では勝手に消える
   let g = min(1.0 / max(-dot(D, n), 0.05), u.tus4.z);
-  let rho = sqrt(max(1.0 - h.hc2, 0.0));
   let thr = u.tusLeaf.w * smoothstep(u.tus5.z, 1.0, rho);
   let cs = (1.0 - exp(-u.tus.w * max(detB - thr, 0.0) * g)) * in.prm.z;
   // 芯も同じ窓で消す。弦の長さだけでは縁に薄い暗い輪が残り、殻の輪郭に見える
   let rimW = 1.0 - smoothstep(u.tus5.z, 1.0, rho);
-  let cc = (1.0 - exp(-u.tus.z * h.hc2 * h.Lw / r)) * rimW * in.prm.z;
+  let cc = (1.0 - exp(-u.tus.z * hc2 * Lw / r)) * rimW * in.prm.z;
   var alpha = 1.0 - (1.0 - cs) * (1.0 - cc);
   let sun = u.sunDir.xyz;
   let light = tussockLight(n, sun);
@@ -783,16 +842,14 @@ struct TuFrag { @location(0) color: vec4f, @builtin(frag_depth) depth: f32 }
   let core = u.tusCore.rgb * light;
   // 殻を芯の手前に置く (premultiplied の合成を alpha で割って straight に戻す)
   var c = (leaf * cs + core * ((1.0 - cs) * cc)) / max(alpha, 1e-4);
-  let dist = length(h.P - O);
+  let dist = length(in.wp - O);
   c = applyFog(c, dist, dot(D, sun));
   if (u.geo2.w > 0.5) {
     let ign = fract(52.9829189 * fract(0.06711056*in.pos.x + 0.00583715*in.pos.y + in.prm.w));
     alpha = alpha + (ign - 0.5) * 0.25;
   }
-  if (!h.hit) { discard; }
-  let clip = u.viewProj * vec4f(h.P, 1.0);
-  var o: TuFrag;
-  o.color = vec4f(tonemap(c), clamp(alpha, 0.0, 1.0));
+  if (pd > 0.0) { discard; }
+  var o = vec4f(tonemap(c), clamp(alpha, 0.0, 1.0));
   if (u.tus5.y > 0.5) {
     let uvg = uv * 16.0;
     let grid = step(0.5, fract(uvg.x)) + step(0.5, fract(uvg.y));
@@ -800,9 +857,8 @@ struct TuFrag { @location(0) color: vec4f, @builtin(frag_depth) depth: f32 }
     if (u.tus5.y > 1.5) { dc = vec3f(select(0.2, 0.8, grid == 1.0)); }
     if (u.tus5.y > 2.5) { dc = vec3f(min(lh, 1.0), isoW, shortW); }
     if (u.tus5.y > 3.5) { dc = vec3f(cs, cc, 0.0); }
-    o.color = vec4f(dc, 1.0);
+    o = vec4f(dc, 1.0);
   }
-  o.depth = clip.z / clip.w;
   return o;
 }
 
@@ -823,8 +879,12 @@ struct TuFrag { @location(0) color: vec4f, @builtin(frag_depth) depth: f32 }
   let Bx = tussockBx(T.axis);
   let Bz = cross(T.axis, Bx);
   let radial = Bx * cos(phi) + Bz * sin(phi);
-  let center = T.center + radial * (T.r * st) + T.axis * (T.a * ct);
-  let axis = normalize(center - (T.base + T.axis * u.tusCore.w));
+  let p0 = T.center + radial * (T.r * st) + T.axis * (T.a * ct);
+  let b = tussockBend(T);
+  let y = dot(p0 - T.base, T.axis);
+  let center = p0 + b.w * bendDisp(b, y);
+  let s0 = normalize(p0 - (T.base + T.axis * u.tusCore.w));
+  let axis = normalize(s0 + b.w * (bendSlope(b, y) * dot(s0, T.axis)));
   let a = u.tus2.z * 0.5 * (0.7 + 0.6 * h2);
   let r = u.tus2.w * 0.5 * (0.7 + 0.6 * h3);
   let d = distance(center, u.camPos.xyz);
@@ -1136,7 +1196,7 @@ async function main() {
       { binding: 7, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, sampler: {} },
     ],
   });
-  const uBuf = device.createBuffer({ size: 336, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const uBuf = device.createBuffer({ size: 352, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const chunkBuf = device.createBuffer({ size: G_MAX_CHUNKS * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
   const chunkData = new Float32Array(G_MAX_CHUNKS * 4);
   const bindA = device.createBindGroup({
@@ -1184,7 +1244,7 @@ async function main() {
     layout: pLayoutA,
     vertex: { module: sceneMod, entryPoint: 'vsTussock' },
     fragment: { module: sceneMod, entryPoint: 'fsTussock', targets },
-    primitive: { topology: 'triangle-strip', cullMode: 'none' },
+    primitive: { topology: 'triangle-list', cullMode: 'none' },
     depthStencil: depthOn,
     multisample: { count: MSAA, alphaToCoverageEnabled: true },
   });
@@ -1334,7 +1394,7 @@ async function main() {
   };
 
   // --- frame loop ---
-  const uData = new Float32Array(84);
+  const uData = new Float32Array(88);
   const tN = Math.ceil(2 * T_P.R / T_P.cell);
   const tBN = Math.ceil(2 * T_P.br / T_P.cell);
 
@@ -1464,6 +1524,7 @@ async function main() {
     uData.set([T_P.k, T_P.debug, T_P.rim0, T_P.iso], 72);
     uData.set([...T_P.leaf, T_P.rimT], 76);
     uData.set([...T_P.core, T_P.org], 80);
+    uData.set([T_P.bend, 0, 0, 0], 84);
     device.queue.writeBuffer(uBuf, 0, uData);
     const chunksInfo = state.geomOn ? collectChunks(viewProj, pos) : { draws: [], n: 0, blades: 0 };
     if (chunksInfo.n > 0) device.queue.writeBuffer(chunkBuf, 0, chunkData, 0, chunksInfo.n * 4);
@@ -1486,7 +1547,8 @@ async function main() {
     pass.drawIndexed(terIdx.length);
     if (state.tussockOn) {
       pass.setPipeline(tussockPipe);
-      pass.draw(4, tN * tN);
+      pass.draw(T_SEG_C * T_RING_C * 6, tN * tN);
+      pass.draw(T_SEG_F * T_RING_F * 6, tBN * tBN, 0, T_LOD_BASE);
       if (state.tBladesOn) {
         pass.setPipeline(tussockBladePipe);
         pass.draw(4, tBN * tBN * T_P.nb);
@@ -1514,7 +1576,7 @@ async function main() {
       `bpc[3/4] ${state.bpc}  radius[5/6] ${state.gRadius.toFixed(0)}m  soft[,/.] ${state.gSoft.toFixed(2)}  sigma[9/0] ${state.gSigma.toFixed(1)}  dither[X] ${state.dither ? 'on' : 'off'}\n` +
       `height[H/J] ${(state.gHeight * 100).toFixed(0)}cm  width[K/L] ${(state.gWidth * 100).toFixed(1)}cm  shade-dens[[/]] ${state.gDens.toFixed(2)}\n` +
       `tussock[U] ${state.tussockOn ? 'on' : 'off'}  r ${T_P.r}m h ${T_P.h}m cell ${T_P.cell}m prob ${T_P.prob} R ${T_P.R}m  core-k[;/'] ${state.tKc.toFixed(2)}  shell-k[Q/E] ${state.tKs.toFixed(2)}  ` +
-      `org ${T_P.org}m lmax ${T_P.lmax} rim ${T_P.rim0}/${T_P.rimT} wrap ${T_P.wrap} k ${T_P.k} iso ${T_P.iso}  blades[Y] ${state.tBladesOn ? 'on' : 'off'} ×${T_P.nb} len ${T_P.bl}m w ${T_P.bw}m R ${T_P.br}m\n` +
+      `org ${T_P.org}m bend ${T_P.bend} lmax ${T_P.lmax} rim ${T_P.rim0}/${T_P.rimT} wrap ${T_P.wrap} k ${T_P.k} iso ${T_P.iso}  blades[Y] ${state.tBladesOn ? 'on' : 'off'} ×${T_P.nb} len ${T_P.bl}m w ${T_P.bw}m R ${T_P.br}m\n` +
       `drag:look  WASD:move  R/F:up/down  Shift:fast  P:pause`;
   }
   function frameWrap(now) {
