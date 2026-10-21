@@ -73,6 +73,7 @@ const T_P = {
 const T_SEG_F = 24, T_RING_F = 12, T_SEG_C = 12, T_RING_C = 6;
 const T_THETA_MAX = 2.0;
 const T_LOD_BASE = 1 << 20;
+const MSAA = 4;
 
 const hud = document.getElementById('hud');
 const canvas = document.getElementById('c');
@@ -251,6 +252,14 @@ fn patchTint(p: vec2f) -> vec3f {
 fn groundAlbedo(p: vec2f) -> vec3f {
   let n = 0.5 + 0.5*sin(p.x*2.3)*sin(p.y*2.9);
   return vec3f(0.20, 0.16, 0.10) * (0.8 + 0.4*n);
+}
+// alpha-to-coverage は MSAA サンプル数に量子化されるので、1 段ぶんの画面ディザで滑らかにする。
+// floor(alpha·N + 乱数)/N にすると alpha = 0 は必ず 0 のまま (alpha に乱数を足す形だと
+// 透明な画素にも 1 サンプルが立ち、縁に点々の輪が残る)。位相 phase はインスタンスごとにずらし、
+// 重なった半透明どうしでマスクが相関しないようにする
+fn ditherAlpha(alpha: f32, pos: vec2f, phase: f32) -> f32 {
+  let ign = fract(52.9829189 * fract(0.06711056*pos.x + 0.00583715*pos.y + phase));
+  return floor(clamp(alpha, 0.0, 1.0) * ${MSAA}.0 + ign) / ${MSAA}.0;
 }
 fn tonemap(c: vec3f) -> vec3f {
   return pow(c / (1.0 + c*0.35), vec3f(1.0/2.2));
@@ -570,12 +579,7 @@ fn densAt(d: f32) -> f32 { return 1.0 - smoothstep(u.geo.x, u.geo.y, d); }
   var alpha = 1.0 - exp(-tau);
   let dist = length(h.P - O);
   let c = applyFog(in.col, dist, dot(D, u.sunDir.xyz));
-  if (u.geo2.w > 0.5) {
-    // alpha-to-coverage は MSAA サンプル数に量子化されるので、1 段ぶんの画面ディザで滑らかにする。
-    // 位相 prm.w をインスタンスごとにずらすと、重なった半透明どうしでマスクが相関しない
-    let ign = fract(52.9829189 * fract(0.06711056*in.pos.x + 0.00583715*in.pos.y + in.prm.w));
-    alpha = alpha + (ign - 0.5) * 0.25;
-  }
+  if (u.geo2.w > 0.5) { alpha = ditherAlpha(alpha, in.pos.xy, in.prm.w); }
   return vec4f(tonemap(c), clamp(alpha, 0.0, 1.0));
 }
 
@@ -840,14 +844,11 @@ fn tussockDetail(duv: vec2f, theta: f32, ddx: vec2f, ddy: vec2f, iso: f32, short
   let leaf = u.tusLeaf.rgb * light * windGain(in.wind.xy, D.xz)
            + TRANS_COL * pow(max(dot(D, sun), 0.0), 6.0) * 0.15;
   let core = u.tusCore.rgb * light;
-  // 殻を芯の手前に置く (premultiplied の合成を alpha で割って straight に戻す)
-  var c = (leaf * cs + core * ((1.0 - cs) * cc)) / max(alpha, 1e-4);
+  // 殻を芯の手前に置く (premultiplied の合成を alpha で割って straight に戻す。alpha ≈ 0 では葉色)
+  var c = select(leaf, (leaf * cs + core * ((1.0 - cs) * cc)) / alpha, alpha > 1e-4);
   let dist = length(in.wp - O);
   c = applyFog(c, dist, dot(D, sun));
-  if (u.geo2.w > 0.5) {
-    let ign = fract(52.9829189 * fract(0.06711056*in.pos.x + 0.00583715*in.pos.y + in.prm.w));
-    alpha = alpha + (ign - 0.5) * 0.25;
-  }
+  if (u.geo2.w > 0.5) { alpha = ditherAlpha(alpha, in.pos.xy, in.prm.w); }
   if (pd > 0.0) { discard; }
   var o = vec4f(tonemap(c), clamp(alpha, 0.0, 1.0));
   if (u.tus5.y > 0.5) {
@@ -1183,7 +1184,6 @@ async function main() {
 
   // --- scene pipelines (MSAA, canvas直描き) ---
   const sceneMod = device.createShaderModule({ code: SCENE_WGSL });
-  const MSAA = 4;
   const layoutA = device.createBindGroupLayout({
     entries: [
       { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: {} },
