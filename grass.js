@@ -57,6 +57,7 @@ const T_P = {
   org: tq('torg', -0.5),     // 針が生える原点の高さ [m] (根元 = 地面を 0 とし、軸に沿って測る。負で地中)
   bend: tq('tbend', 0.2),  // 風で倒す量 (突風 1 のとき、株の高さに対する先端の変位の比)
   gf: tq('tgf', 0.15),     // 地面との境目のフェード幅 [m] (根元の接平面からの鉛直高さ)
+  gm: tq('tgm', 0.04),     // 接平面近似の誤差の見込み [m]。縮めた帯がこれより薄い視線角ではフェードしない
   rim0: tq('trim0', 0.6),  // 縁のしきい値が立ち上がる衝突径数 ρ (正射影の円板での中心からの距離)
   rimT: tq('trimt', 2.0),  // 輪郭 (ρ = 1) での密度しきい値 (平均 1、筋のピーク ~2.4)
   wrap: tq('twrap', 0.5),  // 楕円体法線の wrap lighting 量 (影側を持ち上げる)
@@ -291,7 +292,7 @@ struct U {
   tus5: vec4f,      // 方位図法の倍率, デバッグ表示, 縁のしきい値が立ち上がる ρ, 等方へ混ぜる像の長さの上限
   tusLeaf: vec4f,   // 葉の色, 輪郭での密度しきい値
   tusCore: vec4f,   // 芯の色, 針の原点の高さ (根元から軸に沿って)
-  tus6: vec4f,      // 風で倒す量, 地面フェード幅, 芯の半径 (相似比), -
+  tus6: vec4f,      // 風で倒す量, 地面フェード幅, 芯の半径 (相似比), 接平面近似の誤差の見込み
 }
 fn rhoUV(p: vec2f) -> vec2f {
   return (p - vec2f(${REG_MIN}.0)) / ${REG_SPAN}.0;
@@ -841,9 +842,20 @@ fn tussockDetail(duv: vec2f, theta: f32, ddx: vec2f, ddy: vec2f, iso: f32, short
   // 均一な殻の縁に見える。しきい値なら平均は超えないので遠景では勝手に消える
   let g = min(1.0 / max(-dot(D, n), 0.05), u.tus4.z);
   let thr = u.tusLeaf.w * smoothstep(u.tus5.z, 1.0, rho);
-  // 地面との交線は、地形を根元の接平面で近似した鉛直高さでぼかす (地形の高さは画素では引かない)
+  // 地面との交線は、根元の接平面 (画素では地形を引かない) からの鉛直高さ gf でぼかす。
+  // スレスレの視線では帯の向こうの地面が透けて株が浮くので、帯の上端から視線を延ばした
+  // 着地点が接地半径の内側 (株の足元) に収まる高さ b まで帯を縮める。帯が接平面の誤差 m より
+  // 薄くなる角度では交線は地面の輪郭と重なって見えないので、効果ごと消して不透明にする
+  // (接平面より下の画素も含め、hv = 0 にステップを作らない)
   let hv = in.wp.y - in.gbase.y - dot(in.gslope, in.wp.xz - in.gbase.xz);
-  let fade = in.prm.z * smoothstep(0.0, u.tus6.y, hv);
+  let Ng = normalize(vec3f(-in.gslope.x, 1.0, -in.gslope.y));
+  let sinT = clamp(-dot(D, Ng), 0.0, 1.0);
+  let tanT = sinT / sqrt(max(1.0 - sinT * sinT, 1e-6));
+  let rc0 = r * sqrt(max(1.0 - u.tus4.w * u.tus4.w, 0.0));
+  let b = rc0 * tanT;
+  let gfEff = max(min(u.tus6.y, b), 1e-4);
+  let gfade = mix(1.0, smoothstep(0.0, gfEff, hv), smoothstep(0.0, u.tus6.w, b));
+  let fade = in.prm.z * gfade;
   let cs = (1.0 - exp(-u.tus.w * max(detB - thr, 0.0) * g)) * fade;
   // 芯は相似比 rc の内側の楕円体。密度は縁へ向かって (1−q²) で薄くなる柔らかい球とし、
   // 視線がそこを横切る半弦 (世界長 / r) を掛ける。一様な硬い球 (弦だけ) だと中心が平らで縁が急になる。
@@ -1539,7 +1551,7 @@ async function main() {
     uData.set([T_P.k, T_P.debug, T_P.rim0, T_P.iso], 72);
     uData.set([...T_P.leaf, T_P.rimT], 76);
     uData.set([...T_P.core, T_P.org], 80);
-    uData.set([T_P.bend, T_P.gf, T_P.cr, 0], 84);
+    uData.set([T_P.bend, T_P.gf, T_P.cr, T_P.gm], 84);
     device.queue.writeBuffer(uBuf, 0, uData);
     const chunksInfo = state.geomOn ? collectChunks(viewProj, pos) : { draws: [], n: 0, blades: 0 };
     if (chunksInfo.n > 0) device.queue.writeBuffer(chunkBuf, 0, chunkData, 0, chunksInfo.n * 4);
@@ -1591,7 +1603,7 @@ async function main() {
       `bpc[3/4] ${state.bpc}  radius[5/6] ${state.gRadius.toFixed(0)}m  soft[,/.] ${state.gSoft.toFixed(2)}  sigma[9/0] ${state.gSigma.toFixed(1)}  dither[X] ${state.dither ? 'on' : 'off'}\n` +
       `height[H/J] ${(state.gHeight * 100).toFixed(0)}cm  width[K/L] ${(state.gWidth * 100).toFixed(1)}cm  shade-dens[[/]] ${state.gDens.toFixed(2)}\n` +
       `tussock[U] ${state.tussockOn ? 'on' : 'off'}  r ${T_P.r}m h ${T_P.h}m cell ${T_P.cell}m prob ${T_P.prob} R ${T_P.R}m  core-k[;/'] ${state.tKc.toFixed(2)} cr ${T_P.cr}  shell-k[Q/E] ${state.tKs.toFixed(2)}  ` +
-      `org ${T_P.org}m bend ${T_P.bend} gf ${T_P.gf}m lmax ${T_P.lmax} rim ${T_P.rim0}/${T_P.rimT} wrap ${T_P.wrap} k ${T_P.k} iso ${T_P.iso}  blades[Y] ${state.tBladesOn ? 'on' : 'off'} ×${T_P.nb} len ${T_P.bl}m w ${T_P.bw}m R ${T_P.br}m\n` +
+      `org ${T_P.org}m bend ${T_P.bend} gf ${T_P.gf}m/${T_P.gm}m lmax ${T_P.lmax} rim ${T_P.rim0}/${T_P.rimT} wrap ${T_P.wrap} k ${T_P.k} iso ${T_P.iso}  blades[Y] ${state.tBladesOn ? 'on' : 'off'} ×${T_P.nb} len ${T_P.bl}m w ${T_P.bw}m R ${T_P.br}m\n` +
       `drag:look  WASD:move  R/F:up/down  Shift:fast  P:pause`;
   }
   function frameWrap(now) {
