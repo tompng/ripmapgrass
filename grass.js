@@ -50,11 +50,13 @@ const T_P = {
   cell: tq('tcell', 4),    // 配置セル [m]
   prob: tq('tprob', 0.6),  // セルあたりの出現確率 (マクロ密度で変調)
   R: tq('tR', 150),        // 描画半径 [m]
-  kc: tq('tkc', 3),        // 芯 (暗い塊) の光学的厚さ。弦が直径のとき 1−exp(−kc)
+  kc: tq('tkc', 3),        // 芯 (暗い塊) の光学的厚さ。弦が芯の直径のとき 1−exp(−kc)
+  cr: tq('tcr', 0.75),     // 芯の半径 (殻の楕円体との相似比)
   ks: tq('tks', 0.7),      // 葉の殻の光学的厚さ。正面で密度 1 のとき 1−exp(−ks)
   lmax: tq('tlmax', 1),    // 殻の見かけ厚みの上限 (正面を 1 として、縁のグレージングで伸びる分)
   org: tq('torg', -1),     // 針が生える原点の高さ [m] (根元 = 地面を 0 とし、軸に沿って測る。負で地中)
   bend: tq('tbend', 0.2),  // 風で倒す量 (突風 1 のとき、株の高さに対する先端の変位の比)
+  gf: tq('tgf', 0.15),     // 地面との境目のフェード幅 [m] (根元の接平面からの鉛直高さ)
   rim0: tq('trim0', 0.6),  // 縁のしきい値が立ち上がる衝突径数 ρ (正射影の円板での中心からの距離)
   rimT: tq('trimt', 2.0),  // 輪郭 (ρ = 1) での密度しきい値 (平均 1、筋のピーク ~2.4)
   wrap: tq('twrap', 0.5),  // 楕円体法線の wrap lighting 量 (影側を持ち上げる)
@@ -289,7 +291,7 @@ struct U {
   tus5: vec4f,      // 方位図法の倍率, デバッグ表示, 縁のしきい値が立ち上がる ρ, 等方へ混ぜる像の長さの上限
   tusLeaf: vec4f,   // 葉の色, 輪郭での密度しきい値
   tusCore: vec4f,   // 芯の色, 針の原点の高さ (根元から軸に沿って)
-  tus6: vec4f,      // 風で倒す量, -, -, -
+  tus6: vec4f,      // 風で倒す量, 地面フェード幅, 芯の半径 (相似比), -
 }
 fn rhoUV(p: vec2f) -> vec2f {
   return (p - vec2f(${REG_MIN}.0)) / ${REG_SPAN}.0;
@@ -643,6 +645,7 @@ struct Tussock {
   base: vec3f, center: vec3f, axis: vec3f,
   a: f32, r: f32, keep: f32, rho: f32, rnd: f32,
   wf: vec2f, w: vec2f,
+  slope: vec2f,  // 根元での地形の勾配 ∂h/∂x, ∂h/∂z
 }
 fn tussockAt(gx: i32, gz: i32) -> Tussock {
   var T: Tussock;
@@ -659,6 +662,7 @@ fn tussockAt(gx: i32, gz: i32) -> Tussock {
   T.r = u.tus.x * s;
   T.a = u.tus.y * s / (1.0 + u.tus4.w);
   let N = terrainN(bxz);
+  T.slope = -N.xz / N.y;
   var axis = normalize(mix(N, vec3f(0.0, 1.0, 0.0), 0.5));
   T.wf = vec2f(0.0);
   T.w = vec2f(0.0);
@@ -710,6 +714,8 @@ struct TuOut {
   @location(5) wind: vec4f,   // 風の場 (風向成分, 横成分), 変形の ŵ.xz
   @location(6) origin: vec3f,
   @location(7) bend: vec2f,   // κ, y₀
+  @location(8) gbase: vec3f,  // 根元 (地面フェードの基準面の通過点)
+  @location(9) gslope: vec2f, // 根元での地形の勾配
 }
 // 株のメッシュは緯度経度の半球 + 裾 (極角 0 〜 ${T_THETA_MAX} rad) で、頂点は添字から生成する。
 // 近景 (内側 m×m セル、firstInstance = ${T_LOD_BASE}) は ${T_SEG_F}×${T_RING_F}、遠景は ${T_SEG_C}×${T_RING_C}
@@ -762,6 +768,8 @@ const T_LOD_BASE = ${T_LOD_BASE}u;
   o.wind = vec4f(T.wf, b.w.xz);
   o.origin = T.base + T.axis * u.tusCore.w;
   o.bend = vec2f(b.kappa, b.y0);
+  o.gbase = T.base;
+  o.gslope = T.slope;
   return o;
 }
 
@@ -795,7 +803,6 @@ fn tussockDetail(duv: vec2f, theta: f32, ddx: vec2f, ddy: vec2f, iso: f32, short
   let pd = dot(sph, ds);
   let ds2 = dot(ds, ds);
   let hc2 = pd * pd / ds2;
-  let Lw = abs(pd) / ds2;
   let rho = sqrt(max(1.0 - hc2, 0.0));
   // 変形 J = I + f'(y)·ŵ ⊗ Aᵀ。葉の接線は J·s₀、法線は J⁻ᵀ n₀
   let w3 = vec3f(in.wind.z, 0.0, in.wind.w);
@@ -834,10 +841,18 @@ fn tussockDetail(duv: vec2f, theta: f32, ddx: vec2f, ddy: vec2f, iso: f32, short
   // 均一な殻の縁に見える。しきい値なら平均は超えないので遠景では勝手に消える
   let g = min(1.0 / max(-dot(D, n), 0.05), u.tus4.z);
   let thr = u.tusLeaf.w * smoothstep(u.tus5.z, 1.0, rho);
-  let cs = (1.0 - exp(-u.tus.w * max(detB - thr, 0.0) * g)) * in.prm.z;
-  // 芯も同じ窓で消す。弦の長さだけでは縁に薄い暗い輪が残り、殻の輪郭に見える
-  let rimW = 1.0 - smoothstep(u.tus5.z, 1.0, rho);
-  let cc = (1.0 - exp(-u.tus.z * hc2 * Lw / r)) * rimW * in.prm.z;
+  // 地面との交線は、地形を根元の接平面で近似した鉛直高さでぼかす (地形の高さは画素では引かない)
+  let hv = in.wp.y - in.gbase.y - dot(in.gslope, in.wp.xz - in.gbase.xz);
+  let fade = in.prm.z * smoothstep(0.0, u.tus6.y, hv);
+  let cs = (1.0 - exp(-u.tus.w * max(detB - thr, 0.0) * g)) * fade;
+  // 芯は相似比 rc の内側の楕円体。密度は縁へ向かって (1−q²) で薄くなる柔らかい球とし、
+  // 視線がそこを横切る半弦 (世界長 / r) を掛ける。一様な硬い球 (弦だけ) だと中心が平らで縁が急になる。
+  // 縁には同じ窓を掛ける (弦だけでは薄い暗い輪が残り、殻の輪郭に見える)
+  let rc = u.tus6.z;
+  let q = rho / rc;
+  let coreChord = sqrt(max(rc * rc - rho * rho, 0.0)) / sqrt(ds2);
+  let rimW = 1.0 - smoothstep(u.tus5.z, 1.0, q);
+  let cc = (1.0 - exp(-u.tus.z * max(1.0 - q * q, 0.0) * coreChord / r)) * rimW * fade;
   var alpha = 1.0 - (1.0 - cs) * (1.0 - cc);
   let sun = u.sunDir.xyz;
   let light = tussockLight(n, sun);
@@ -1524,7 +1539,7 @@ async function main() {
     uData.set([T_P.k, T_P.debug, T_P.rim0, T_P.iso], 72);
     uData.set([...T_P.leaf, T_P.rimT], 76);
     uData.set([...T_P.core, T_P.org], 80);
-    uData.set([T_P.bend, 0, 0, 0], 84);
+    uData.set([T_P.bend, T_P.gf, T_P.cr, 0], 84);
     device.queue.writeBuffer(uBuf, 0, uData);
     const chunksInfo = state.geomOn ? collectChunks(viewProj, pos) : { draws: [], n: 0, blades: 0 };
     if (chunksInfo.n > 0) device.queue.writeBuffer(chunkBuf, 0, chunkData, 0, chunksInfo.n * 4);
@@ -1575,8 +1590,8 @@ async function main() {
       `geom[G] ${state.geomOn ? 'on' : 'off'}  blades ${(chunksInfo.blades / 1000).toFixed(0)}k / ${chunksInfo.n} chunks  ` +
       `bpc[3/4] ${state.bpc}  radius[5/6] ${state.gRadius.toFixed(0)}m  soft[,/.] ${state.gSoft.toFixed(2)}  sigma[9/0] ${state.gSigma.toFixed(1)}  dither[X] ${state.dither ? 'on' : 'off'}\n` +
       `height[H/J] ${(state.gHeight * 100).toFixed(0)}cm  width[K/L] ${(state.gWidth * 100).toFixed(1)}cm  shade-dens[[/]] ${state.gDens.toFixed(2)}\n` +
-      `tussock[U] ${state.tussockOn ? 'on' : 'off'}  r ${T_P.r}m h ${T_P.h}m cell ${T_P.cell}m prob ${T_P.prob} R ${T_P.R}m  core-k[;/'] ${state.tKc.toFixed(2)}  shell-k[Q/E] ${state.tKs.toFixed(2)}  ` +
-      `org ${T_P.org}m bend ${T_P.bend} lmax ${T_P.lmax} rim ${T_P.rim0}/${T_P.rimT} wrap ${T_P.wrap} k ${T_P.k} iso ${T_P.iso}  blades[Y] ${state.tBladesOn ? 'on' : 'off'} ×${T_P.nb} len ${T_P.bl}m w ${T_P.bw}m R ${T_P.br}m\n` +
+      `tussock[U] ${state.tussockOn ? 'on' : 'off'}  r ${T_P.r}m h ${T_P.h}m cell ${T_P.cell}m prob ${T_P.prob} R ${T_P.R}m  core-k[;/'] ${state.tKc.toFixed(2)} cr ${T_P.cr}  shell-k[Q/E] ${state.tKs.toFixed(2)}  ` +
+      `org ${T_P.org}m bend ${T_P.bend} gf ${T_P.gf}m lmax ${T_P.lmax} rim ${T_P.rim0}/${T_P.rimT} wrap ${T_P.wrap} k ${T_P.k} iso ${T_P.iso}  blades[Y] ${state.tBladesOn ? 'on' : 'off'} ×${T_P.nb} len ${T_P.bl}m w ${T_P.bw}m R ${T_P.br}m\n` +
       `drag:look  WASD:move  R/F:up/down  Shift:fast  P:pause`;
   }
   function frameWrap(now) {
