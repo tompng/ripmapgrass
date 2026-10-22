@@ -72,9 +72,11 @@ const T_P = {
   debug: tq('tdebug', 0),  // 1: 詳細密度, 2: 表面 uv の格子, 3: 像の長さ (R) / 等方 (G) / 短 (B) の重み
 };
 
-// 株メッシュ: 緯度経度の半球 + 裾。遠景は粗いメッシュ、近景 (ブレードと同じ内側グリッド) は細かいメッシュ
-const T_SEG_F = 24, T_RING_F = 12, T_SEG_C = 12, T_RING_C = 6;
-const T_THETA_MAX = 2.0;
+// 株メッシュ: 緯度経度の半球 + 裾。遠景は粗いメッシュ、近景 (ブレードと同じ内側グリッド) は細かいメッシュ。
+// 裾の縁 (極角 T_THETA_MAX) は根元の面から 0.5a 下。軸は地面法線から斜度の半分傾くので、
+// 2.0 rad (0.18m 下) だと斜度 22° 以上で下り側の縁が地面の上に出て、低い視点から底の穴が見えた
+const T_SEG_F = 24, T_RING_F = 14, T_SEG_C = 12, T_RING_C = 7;
+const T_THETA_MAX = 2.5;
 const T_LOD_BASE = 1 << 20;
 const MSAA = 4;
 
@@ -1322,6 +1324,8 @@ async function main() {
     time: 0, fps: 0,
   };
   state.pos[1] = terrainHJS(0, 240) + 1.7;
+  const camQ = (q.get('cam') || '').split(',').map(Number);
+  if (camQ.length === 5 && camQ.every(Number.isFinite)) { state.pos = camQ.slice(0, 3); state.yaw = camQ[3]; state.pitch = camQ[4]; }
 
   let msaaTex = null, depthTex = null, curW = 0, curH = 0;
   function ensureTargets(w, h) {
@@ -1604,7 +1608,7 @@ async function main() {
       `height[H/J] ${(state.gHeight * 100).toFixed(0)}cm  width[K/L] ${(state.gWidth * 100).toFixed(1)}cm  shade-dens[[/]] ${state.gDens.toFixed(2)}\n` +
       `tussock[U] ${state.tussockOn ? 'on' : 'off'}  r ${T_P.r}m h ${T_P.h}m cell ${T_P.cell}m prob ${T_P.prob} R ${T_P.R}m  core-k[;/'] ${state.tKc.toFixed(2)} cr ${T_P.cr}  shell-k[Q/E] ${state.tKs.toFixed(2)}  ` +
       `org ${T_P.org}m bend ${T_P.bend} gf ${T_P.gf}m/${T_P.gm}m lmax ${T_P.lmax} rim ${T_P.rim0}/${T_P.rimT} wrap ${T_P.wrap} k ${T_P.k} iso ${T_P.iso}  blades[Y] ${state.tBladesOn ? 'on' : 'off'} ×${T_P.nb} len ${T_P.bl}m w ${T_P.bw}m R ${T_P.br}m\n` +
-      `drag:look  WASD:move  R/F:up/down  Shift:fast  P:pause`;
+      `drag:look  WASD:move  R/F:up/down  Shift:fast  P:pause  cam=${state.pos.map(v => v.toFixed(2)).join(',')},${state.yaw.toFixed(3)},${state.pitch.toFixed(3)}`;
   }
   function frameWrap(now) {
     try {
